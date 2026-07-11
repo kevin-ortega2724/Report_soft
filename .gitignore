@@ -1,0 +1,25 @@
+# Entornos y caches
+.venv/
+__pycache__/
+*.pyc
+.claude/
+
+# Config local -- puede contener credenciales, nunca versionar
+config/
+
+# Datos generados / institucionales (BD con datos personales, caché de
+# verificación, scraping de GrupLAC, reportes exportados) -- grandes y/o
+# con información personal (cédulas, nombres). Se regeneran desde la app.
+data/
+reports/
+faltantes.zip
+faltantes_extracted/
+Modelo_medicion/
+*.xlsx
+*.pdf
+
+# Notas de trabajo informales con datos personales (cédulas reales) --
+# fuera del repo por ahora, ver README.md / CHANGELOG.md para el historial
+# ya depurado.
+claude_1.md
+cambios_quitados.txt

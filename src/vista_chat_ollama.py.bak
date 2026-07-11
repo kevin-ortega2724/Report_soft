@@ -1,0 +1,1037 @@
+# vista_chat_ollama.py
+"""
+Chatbot mejorado con acceso directo a la base de datos académica.
+Versión integrada - solo reemplazar este archivo.
+"""
+
+from __future__ import annotations
+
+import json
+import requests
+import sqlite3
+from typing import Dict, List, Any, Optional
+from collections import defaultdict
+
+from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QTextEdit, QLineEdit, QComboBox, QCheckBox, QSpinBox, QGroupBox
+)
+
+
+# =============================================================================
+# CONSULTOR DE BASE DE DATOS
+# =============================================================================
+
+class ConsultorBaseDatos:
+    """
+    Interfaz inteligente para consultas a la base de datos académica.
+    """
+    
+    def __init__(self, db_manager):
+        self.db = db_manager
+        self.cursor = self.db.conn.cursor()
+    
+    def listar_grupos(self, filtro_texto: Optional[str] = None) -> List[Dict]:
+        """Lista todos los grupos con estadísticas básicas"""
+        query = '''
+            SELECT 
+                g.grupo,
+                COUNT(DISTINCT g.cedula) as num_integrantes,
+                g.facultad
+            FROM grupos g
+            WHERE g.grupo IS NOT NULL AND g.grupo != ''
+        '''
+        
+        params = []
+        if filtro_texto:
+            query += " AND LOWER(g.grupo) LIKE LOWER(?)"
+            params.append(f"%{filtro_texto}%")
+        
+        query += " GROUP BY g.grupo ORDER BY g.grupo"
+        
+        resultados = self.cursor.execute(query, params).fetchall()
+        
+        grupos = []
+        for grupo, num_int, facultad in resultados:
+            grupos.append({
+                'nombre': grupo,
+                'integrantes': num_int,
+                'facultad': facultad or 'No especificada',
+                'estadisticas': self._obtener_estadisticas_grupo(grupo)
+            })
+        
+        return grupos
+    
+    def _obtener_estadisticas_grupo(self, grupo: str) -> Dict[str, int]:
+        """Obtiene estadísticas de producción de un grupo"""
+        stats = {}
+        
+        stats['publicaciones'] = self.cursor.execute('''
+            SELECT COUNT(*) FROM publicaciones 
+            WHERE cedula IN (SELECT cedula FROM grupos WHERE grupo = ?)
+        ''', (grupo,)).fetchone()[0]
+        
+        stats['extensiones'] = self.cursor.execute('''
+            SELECT COUNT(*) FROM extensiones 
+            WHERE cedula IN (SELECT cedula FROM grupos WHERE grupo = ?)
+        ''', (grupo,)).fetchone()[0]
+        
+        stats['trabajos_grado'] = self.cursor.execute('''
+            SELECT COUNT(*) FROM trabajos_grado 
+            WHERE cedula_director IN (SELECT cedula FROM grupos WHERE grupo = ?)
+        ''', (grupo,)).fetchone()[0]
+        
+        stats['proyectos'] = self.cursor.execute('''
+            SELECT COUNT(*) FROM proyectos 
+            WHERE cedula IN (SELECT cedula FROM grupos WHERE grupo = ?)
+        ''', (grupo,)).fetchone()[0]
+        
+        return stats
+    
+    def obtener_detalle_grupo(self, nombre_grupo: str) -> Dict[str, Any]:
+        """Obtiene información completa de un grupo específico"""
+        
+        # Integrantes
+        integrantes = self.cursor.execute('''
+            SELECT p.nombre, p.cedula, g.tipo_miembro, p.email
+            FROM grupos g
+            JOIN personas p ON g.cedula = p.cedula
+            WHERE g.grupo = ?
+            ORDER BY p.nombre
+        ''', (nombre_grupo,)).fetchall()
+        
+        # Publicaciones recientes
+        publicaciones = self.cursor.execute('''
+            SELECT titulo, año, tipo, categoria, revista_libro
+            FROM publicaciones
+            WHERE cedula IN (SELECT cedula FROM grupos WHERE grupo = ?)
+            AND año >= 2022
+            ORDER BY año DESC
+            LIMIT 15
+        ''', (nombre_grupo,)).fetchall()
+        
+        # Proyectos
+        proyectos = self.cursor.execute('''
+            SELECT titulo, año, tipo, estado, codigo_cie
+            FROM proyectos
+            WHERE cedula IN (SELECT cedula FROM grupos WHERE grupo = ?)
+            ORDER BY año DESC
+            LIMIT 10
+        ''', (nombre_grupo,)).fetchall()
+        
+        return {
+            'nombre': nombre_grupo,
+            'integrantes': [
+                {
+                    'nombre': i[0],
+                    'cedula': i[1],
+                    'tipo': i[2],
+                    'email': i[3]
+                } for i in integrantes
+            ],
+            'publicaciones_recientes': [
+                {
+                    'titulo': p[0],
+                    'año': p[1],
+                    'tipo': p[2],
+                    'categoria': p[3],
+                    'revista': p[4]
+                } for p in publicaciones
+            ],
+            'proyectos': [
+                {
+                    'titulo': pr[0],
+                    'año': pr[1],
+                    'tipo': pr[2],
+                    'estado': pr[3],
+                    'codigo': pr[4]
+                } for pr in proyectos
+            ],
+            'estadisticas': self._obtener_estadisticas_grupo(nombre_grupo)
+        }
+    
+    def analizar_produccion_por_año(self, año_inicio: int, año_fin: int) -> Dict[str, Any]:
+        """Analiza la producción académica en un rango de años"""
+        
+        analisis = {
+            'rango': f"{año_inicio}-{año_fin}",
+            'por_tipo': {},
+            'por_año': defaultdict(lambda: defaultdict(int)),
+            'total': 0
+        }
+        
+        # Publicaciones
+        pubs = self.cursor.execute('''
+            SELECT año, tipo, COUNT(*) as cantidad
+            FROM publicaciones
+            WHERE año BETWEEN ? AND ?
+            GROUP BY año, tipo
+        ''', (año_inicio, año_fin)).fetchall()
+        
+        for año, tipo, cantidad in pubs:
+            analisis['por_año'][año]['publicaciones'] += cantidad
+            tipo_key = f"Publicaciones {tipo}" if tipo else "Publicaciones"
+            analisis['por_tipo'][tipo_key] = analisis['por_tipo'].get(tipo_key, 0) + cantidad
+            analisis['total'] += cantidad
+        
+        # Proyectos
+        proyectos = self.cursor.execute('''
+            SELECT año, tipo, COUNT(*) as cantidad
+            FROM proyectos
+            WHERE año BETWEEN ? AND ?
+            GROUP BY año, tipo
+        ''', (año_inicio, año_fin)).fetchall()
+        
+        for año, tipo, cantidad in proyectos:
+            analisis['por_año'][año]['proyectos'] += cantidad
+            tipo_key = f"Proyectos {tipo}" if tipo else "Proyectos"
+            analisis['por_tipo'][tipo_key] = analisis['por_tipo'].get(tipo_key, 0) + cantidad
+            analisis['total'] += cantidad
+        
+        # Extensiones
+        ext = self.cursor.execute('''
+            SELECT año, COUNT(*) as cantidad
+            FROM extensiones
+            WHERE año BETWEEN ? AND ?
+            GROUP BY año
+        ''', (año_inicio, año_fin)).fetchall()
+        
+        for año, cantidad in ext:
+            analisis['por_año'][año]['extensiones'] = cantidad
+            analisis['por_tipo']['Extensiones'] = analisis['por_tipo'].get('Extensiones', 0) + cantidad
+            analisis['total'] += cantidad
+        
+        return analisis
+    
+    def obtener_top_investigadores(self, limite: int = 10, tipo_producto: str = 'todos') -> List[Dict]:
+        """Obtiene los investigadores más productivos"""
+        
+        if tipo_producto == 'publicaciones':
+            query = '''
+                SELECT p.nombre, p.cedula, COUNT(*) as total
+                FROM personas p
+                JOIN publicaciones pub ON p.cedula = pub.cedula
+                GROUP BY p.cedula, p.nombre
+                ORDER BY total DESC
+                LIMIT ?
+            '''
+        elif tipo_producto == 'proyectos':
+            query = '''
+                SELECT p.nombre, p.cedula, COUNT(*) as total
+                FROM personas p
+                JOIN proyectos pr ON p.cedula = pr.cedula
+                GROUP BY p.cedula, p.nombre
+                ORDER BY total DESC
+                LIMIT ?
+            '''
+        else:  # todos
+            query = '''
+                SELECT p.nombre, p.cedula, 
+                    (SELECT COUNT(*) FROM publicaciones WHERE cedula = p.cedula) +
+                    (SELECT COUNT(*) FROM proyectos WHERE cedula = p.cedula) +
+                    (SELECT COUNT(*) FROM extensiones WHERE cedula = p.cedula) +
+                    (SELECT COUNT(*) FROM trabajos_grado WHERE cedula_director = p.cedula) as total
+                FROM personas p
+                WHERE total > 0
+                ORDER BY total DESC
+                LIMIT ?
+            '''
+        
+        resultados = self.cursor.execute(query, (limite,)).fetchall()
+        
+        return [
+            {
+                'nombre': r[0],
+                'cedula': r[1],
+                'total_productos': r[2],
+                'grupos': self._obtener_grupos_investigador(r[1])
+            } for r in resultados
+        ]
+    
+    def _obtener_grupos_investigador(self, cedula: str) -> List[str]:
+        """Obtiene los grupos de un investigador"""
+        grupos = self.cursor.execute('''
+            SELECT DISTINCT grupo FROM grupos WHERE cedula = ?
+        ''', (cedula,)).fetchall()
+        return [g[0] for g in grupos if g[0]]
+    
+    def comparar_grupos(self, grupo1: str, grupo2: str) -> Dict[str, Any]:
+        """Compara dos grupos de investigación"""
+        
+        detalle1 = self.obtener_detalle_grupo(grupo1)
+        detalle2 = self.obtener_detalle_grupo(grupo2)
+        
+        return {
+            'grupo1': {
+                'nombre': grupo1,
+                'integrantes': len(detalle1['integrantes']),
+                'estadisticas': detalle1['estadisticas']
+            },
+            'grupo2': {
+                'nombre': grupo2,
+                'integrantes': len(detalle2['integrantes']),
+                'estadisticas': detalle2['estadisticas']
+            },
+            'diferencias': {
+                'integrantes': len(detalle1['integrantes']) - len(detalle2['integrantes']),
+                'publicaciones': detalle1['estadisticas']['publicaciones'] - detalle2['estadisticas']['publicaciones'],
+                'proyectos': detalle1['estadisticas']['proyectos'] - detalle2['estadisticas']['proyectos']
+            }
+        }
+    
+    def buscar_productos_por_palabras_clave(self, palabras: List[str], 
+                                           tipo: Optional[str] = None,
+                                           año_desde: Optional[int] = None) -> List[Dict]:
+        """Busca productos académicos por palabras clave"""
+        
+        resultados = []
+        
+        # Buscar en publicaciones
+        if tipo in [None, 'publicacion']:
+            query = "SELECT titulo, año, tipo, categoria FROM publicaciones WHERE "
+            condiciones = [f"LOWER(titulo) LIKE LOWER('%{p}%')" for p in palabras]
+            query += " AND ".join(condiciones)
+            if año_desde:
+                query += f" AND año >= {año_desde}"
+            query += " ORDER BY año DESC LIMIT 20"
+            
+            try:
+                pubs = self.cursor.execute(query).fetchall()
+                resultados.extend([
+                    {
+                        'tipo': 'Publicación',
+                        'titulo': p[0],
+                        'año': p[1],
+                        'subtipo': p[2],
+                        'categoria': p[3]
+                    } for p in pubs
+                ])
+            except:
+                pass
+        
+        # Buscar en proyectos
+        if tipo in [None, 'proyecto']:
+            query = "SELECT titulo, año, tipo, estado FROM proyectos WHERE "
+            condiciones = [f"LOWER(titulo) LIKE LOWER('%{p}%')" for p in palabras]
+            query += " AND ".join(condiciones)
+            if año_desde:
+                query += f" AND año >= {año_desde}"
+            query += " ORDER BY año DESC LIMIT 20"
+            
+            try:
+                proys = self.cursor.execute(query).fetchall()
+                resultados.extend([
+                    {
+                        'tipo': 'Proyecto',
+                        'titulo': pr[0],
+                        'año': pr[1],
+                        'subtipo': pr[2],
+                        'estado': pr[3]
+                    } for pr in proys
+                ])
+            except:
+                pass
+        
+        return resultados
+    
+    def obtener_tendencias_investigacion(self, ventana_años: int = 5) -> Dict[str, Any]:
+        """Analiza tendencias en los últimos N años"""
+        
+        año_actual = 2025
+        año_inicio = año_actual - ventana_años
+        
+        # Categorías más frecuentes en publicaciones
+        categorias = self.cursor.execute('''
+            SELECT categoria, COUNT(*) as cantidad
+            FROM publicaciones
+            WHERE año >= ? AND categoria IS NOT NULL AND categoria != ''
+            GROUP BY categoria
+            ORDER BY cantidad DESC
+            LIMIT 10
+        ''', (año_inicio,)).fetchall()
+        
+        # Tipos de proyecto más comunes
+        tipos_proyecto = self.cursor.execute('''
+            SELECT tipo, COUNT(*) as cantidad
+            FROM proyectos
+            WHERE año >= ? AND tipo IS NOT NULL AND tipo != ''
+            GROUP BY tipo
+            ORDER BY cantidad DESC
+            LIMIT 10
+        ''', (año_inicio,)).fetchall()
+        
+        # Evolución temporal
+        evolucion = self.cursor.execute('''
+            SELECT año, COUNT(*) as total
+            FROM publicaciones
+            WHERE año >= ?
+            GROUP BY año
+            ORDER BY año
+        ''', (año_inicio,)).fetchall()
+        
+        return {
+            'periodo': f"{año_inicio}-{año_actual}",
+            'categorias_populares': [
+                {'categoria': c[0], 'cantidad': c[1]} for c in categorias
+            ],
+            'tipos_proyecto_comunes': [
+                {'tipo': t[0], 'cantidad': t[1]} for t in tipos_proyecto
+            ],
+            'evolucion_anual': [
+                {'año': e[0], 'publicaciones': e[1]} for e in evolucion
+            ]
+        }
+    
+    def buscar_investigador(self, nombre_parcial: str) -> List[Dict]:
+        """Busca investigadores por nombre"""
+        
+        investigadores = self.cursor.execute('''
+            SELECT p.nombre, p.cedula, p.email, p.facultad
+            FROM personas p
+            WHERE LOWER(p.nombre) LIKE LOWER(?)
+            LIMIT 10
+        ''', (f"%{nombre_parcial}%",)).fetchall()
+        
+        return [
+            {
+                'nombre': inv[0],
+                'cedula': inv[1],
+                'email': inv[2],
+                'facultad': inv[3],
+                'grupos': self._obtener_grupos_investigador(inv[1]),
+                'produccion': self._obtener_estadisticas_investigador(inv[1])
+            } for inv in investigadores
+        ]
+    
+    def _obtener_estadisticas_investigador(self, cedula: str) -> Dict[str, int]:
+        """Obtiene estadísticas de producción de un investigador"""
+        
+        stats = {}
+        
+        stats['publicaciones'] = self.cursor.execute(
+            'SELECT COUNT(*) FROM publicaciones WHERE cedula = ?', (cedula,)
+        ).fetchone()[0]
+        
+        stats['proyectos'] = self.cursor.execute(
+            'SELECT COUNT(*) FROM proyectos WHERE cedula = ?', (cedula,)
+        ).fetchone()[0]
+        
+        stats['extensiones'] = self.cursor.execute(
+            'SELECT COUNT(*) FROM extensiones WHERE cedula = ?', (cedula,)
+        ).fetchone()[0]
+        
+        stats['trabajos_dirigidos'] = self.cursor.execute(
+            'SELECT COUNT(*) FROM trabajos_grado WHERE cedula_director = ?', (cedula,)
+        ).fetchone()[0]
+        
+        return stats
+
+
+# =============================================================================
+# HERRAMIENTAS PARA EL LLM
+# =============================================================================
+
+class HerramientasLLM:
+    """
+    Define y ejecuta herramientas que el LLM puede invocar.
+    Compatible con function calling de Ollama.
+    """
+    
+    def __init__(self, consultor: ConsultorBaseDatos):
+        self.consultor = consultor
+    
+    def get_tools_definition(self) -> List[Dict]:
+        """Define las herramientas disponibles en formato JSON"""
+        
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "listar_grupos",
+                    "description": "Lista todos los grupos de investigación con estadísticas. Usa esto cuando pregunten por grupos o quieran ver un listado general.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filtro": {
+                                "type": "string",
+                                "description": "Texto para filtrar grupos (ej: 'electr' para grupos de electrónica)"
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "detalle_grupo",
+                    "description": "Obtiene información detallada de un grupo específico: integrantes, publicaciones recientes, proyectos. Úsalo cuando pregunten sobre un grupo en particular.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "nombre_grupo": {
+                                "type": "string",
+                                "description": "Nombre completo del grupo"
+                            }
+                        },
+                        "required": ["nombre_grupo"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "analizar_produccion",
+                    "description": "Analiza producción académica en un rango de años. Muestra estadísticas y evolución temporal.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "año_inicio": {
+                                "type": "integer",
+                                "description": "Año inicial (ej: 2022)"
+                            },
+                            "año_fin": {
+                                "type": "integer",
+                                "description": "Año final (ej: 2024)"
+                            }
+                        },
+                        "required": ["año_inicio", "año_fin"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "top_investigadores",
+                    "description": "Obtiene los investigadores más productivos. Úsalo para preguntas sobre quiénes son los más destacados.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "limite": {
+                                "type": "integer",
+                                "description": "Número de investigadores (default: 10)"
+                            },
+                            "tipo": {
+                                "type": "string",
+                                "enum": ["todos", "publicaciones", "proyectos"],
+                                "description": "Tipo de producción"
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "comparar_grupos",
+                    "description": "Compara dos grupos mostrando diferencias en producción.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "grupo1": {"type": "string", "description": "Primer grupo"},
+                            "grupo2": {"type": "string", "description": "Segundo grupo"}
+                        },
+                        "required": ["grupo1", "grupo2"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "buscar_productos",
+                    "description": "Busca productos académicos por palabras clave en títulos.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "palabras_clave": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Palabras a buscar"
+                            },
+                            "tipo": {
+                                "type": "string",
+                                "enum": ["publicacion", "proyecto"],
+                                "description": "Tipo de producto"
+                            },
+                            "año_desde": {
+                                "type": "integer",
+                                "description": "Año mínimo"
+                            }
+                        },
+                        "required": ["palabras_clave"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "tendencias_investigacion",
+                    "description": "Analiza tendencias de los últimos años: categorías populares y evolución.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "ventana_años": {
+                                "type": "integer",
+                                "description": "Años hacia atrás (default: 5)"
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "buscar_investigador",
+                    "description": "Busca investigadores por nombre y muestra su producción.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "nombre": {
+                                "type": "string",
+                                "description": "Nombre o apellido del investigador"
+                            }
+                        },
+                        "required": ["nombre"]
+                    }
+                }
+            }
+        ]
+    
+    def ejecutar_herramienta(self, nombre: str, argumentos: Dict) -> str:
+        """Ejecuta una herramienta y retorna resultado en JSON"""
+        
+        try:
+            if nombre == "listar_grupos":
+                resultado = self.consultor.listar_grupos(
+                    filtro_texto=argumentos.get('filtro')
+                )
+            
+            elif nombre == "detalle_grupo":
+                resultado = self.consultor.obtener_detalle_grupo(
+                    argumentos['nombre_grupo']
+                )
+            
+            elif nombre == "analizar_produccion":
+                resultado = self.consultor.analizar_produccion_por_año(
+                    argumentos['año_inicio'],
+                    argumentos['año_fin']
+                )
+            
+            elif nombre == "top_investigadores":
+                resultado = self.consultor.obtener_top_investigadores(
+                    limite=argumentos.get('limite', 10),
+                    tipo_producto=argumentos.get('tipo', 'todos')
+                )
+            
+            elif nombre == "comparar_grupos":
+                resultado = self.consultor.comparar_grupos(
+                    argumentos['grupo1'],
+                    argumentos['grupo2']
+                )
+            
+            elif nombre == "buscar_productos":
+                resultado = self.consultor.buscar_productos_por_palabras_clave(
+                    palabras=argumentos['palabras_clave'],
+                    tipo=argumentos.get('tipo'),
+                    año_desde=argumentos.get('año_desde')
+                )
+            
+            elif nombre == "tendencias_investigacion":
+                resultado = self.consultor.obtener_tendencias_investigacion(
+                    ventana_años=argumentos.get('ventana_años', 5)
+                )
+            
+            elif nombre == "buscar_investigador":
+                resultado = self.consultor.buscar_investigador(
+                    argumentos['nombre']
+                )
+            
+            else:
+                resultado = {"error": f"Herramienta '{nombre}' no encontrada"}
+            
+            return json.dumps(resultado, ensure_ascii=False, indent=2)
+        
+        except Exception as e:
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+# =============================================================================
+# WORKER THREAD
+# =============================================================================
+
+class OllamaChatWorker(QThread):
+    """Worker thread para comunicación con Ollama"""
+    
+    token = pyqtSignal(str)
+    done = pyqtSignal(str)
+    error = pyqtSignal(str)
+    tool_call = pyqtSignal(str, dict)
+    
+    def __init__(self, model, messages, tools=None, host="http://localhost:11434", temperature=0.4):
+        super().__init__()
+        self.model = model
+        self.messages = messages
+        self.tools = tools or []
+        self.host = host.rstrip("/")
+        self.temperature = float(temperature)
+    
+    def run(self):
+        try:
+            url = f"{self.host}/api/chat"
+            
+            payload = {
+                "model": self.model,
+                "messages": self.messages,
+                "stream": True,
+                "options": {"temperature": self.temperature}
+            }
+            
+            # Agregar tools si están disponibles
+            if self.tools:
+                payload["tools"] = self.tools
+            
+            r = requests.post(url, json=payload, stream=True, timeout=300)
+            
+            if r.status_code == 404:
+                # Fallback a /api/generate
+                gen_url = f"{self.host}/api/generate"
+                prompt = self._messages_to_prompt(self.messages)
+                payload = {
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": True,
+                    "options": {"temperature": self.temperature}
+                }
+                r = requests.post(gen_url, json=payload, stream=True, timeout=300)
+            
+            r.raise_for_status()
+            
+            full_response = []
+            
+            for line in r.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                
+                try:
+                    data = json.loads(line)
+                except:
+                    continue
+                
+                # Detectar tool calls
+                if "message" in data and data["message"]:
+                    msg = data["message"]
+                    
+                    if "tool_calls" in msg and msg["tool_calls"]:
+                        for tool_call in msg["tool_calls"]:
+                            tool_name = tool_call["function"]["name"]
+                            tool_args = json.loads(tool_call["function"]["arguments"])
+                            self.tool_call.emit(tool_name, tool_args)
+                    
+                    if "content" in msg and msg["content"]:
+                        chunk = msg["content"]
+                        full_response.append(chunk)
+                        self.token.emit(chunk)
+                
+                # /api/generate fallback
+                if "response" in data:
+                    chunk = data["response"]
+                    full_response.append(chunk)
+                    self.token.emit(chunk)
+                
+                if data.get("done") is True:
+                    break
+            
+            self.done.emit("".join(full_response))
+        
+        except Exception as e:
+            self.error.emit(str(e))
+    
+    @staticmethod
+    def _messages_to_prompt(messages):
+        """Convierte mensajes a prompt simple"""
+        prompt_parts = []
+        for m in messages:
+            role = m.get("role", "")
+            content = m.get("content", "")
+            if role == "system":
+                prompt_parts.append(f"Sistema: {content}\n")
+            elif role == "user":
+                prompt_parts.append(f"Usuario: {content}\n")
+            elif role == "assistant":
+                prompt_parts.append(f"Asistente: {content}\n")
+        return "\n".join(prompt_parts)
+
+
+# =============================================================================
+# VISTA DEL CHATBOT
+# =============================================================================
+
+class VistaChatOllama(QWidget):
+    """
+    Vista del chatbot mejorado con acceso a base de datos.
+    Compatible con la interfaz anterior pero con funcionalidad extendida.
+    """
+    
+    def __init__(self, vista_seguimiento):
+        super().__init__()
+        self.setWindowTitle("Asistente IA - Ollama")
+        self.vista_seguimiento = vista_seguimiento
+        
+        # Obtener DB manager desde vista_seguimiento
+        if hasattr(vista_seguimiento, 'db'):
+            self.db_manager = vista_seguimiento.db
+        else:
+            self.db_manager = None
+        
+        # Inicializar consultor y herramientas
+        if self.db_manager:
+            self.consultor = ConsultorBaseDatos(self.db_manager)
+            self.herramientas_llm = HerramientasLLM(self.consultor)
+        else:
+            self.consultor = None
+            self.herramientas_llm = None
+        
+        self.worker = None
+        self.conversation_history = []
+        
+        self.setup_ui()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        
+        # === HEADER ===
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>🤖 Asistente IA con Acceso a Base de Datos</b>"))
+        
+        # Modelo
+        header.addWidget(QLabel("Modelo:"))
+        self.combo_model = QComboBox()
+        self.combo_model.addItems([
+            "llama3.1", "qwen2.5:7b", "llama3", "mistral"
+        ])
+        header.addWidget(self.combo_model)
+        
+        # Temperature
+        header.addWidget(QLabel("Temp:"))
+        self.spin_temp = QSpinBox()
+        self.spin_temp.setRange(0, 100)
+        self.spin_temp.setValue(40)
+        self.spin_temp.setSuffix("%")
+        self.spin_temp.setMaximumWidth(70)
+        header.addWidget(self.spin_temp)
+        
+        # Botón reset
+        self.btn_reset = QPushButton("🔄 Nuevo chat")
+        self.btn_reset.clicked.connect(self.reset_chat)
+        header.addWidget(self.btn_reset)
+        
+        header.addStretch()
+        layout.addLayout(header)
+        
+        # === OPCIONES ===
+        options_group = QGroupBox("Opciones de Contexto")
+        options_layout = QHBoxLayout(options_group)
+        
+        self.check_seguimiento = QCheckBox("Incluir datos Seguimiento")
+        self.check_seguimiento.setChecked(True)
+        options_layout.addWidget(self.check_seguimiento)
+        
+        self.check_tools = QCheckBox("Consultas a BD (function calling)")
+        self.check_tools.setChecked(True)
+        self.check_tools.setToolTip("Permite al LLM consultar la base de datos")
+        options_layout.addWidget(self.check_tools)
+        
+        options_layout.addStretch()
+        layout.addWidget(options_group)
+        
+        # === CHAT VIEW ===
+        self.chat_view = QTextEdit()
+        self.chat_view.setReadOnly(True)
+        self.chat_view.setStyleSheet("background:#fbfbfb; font-size:11px;")
+        layout.addWidget(self.chat_view, 1)
+        
+        # === INPUT ===
+        input_layout = QHBoxLayout()
+        
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("Pregunta sobre grupos, investigadores, producción académica...")
+        self.input.returnPressed.connect(self.send)
+        input_layout.addWidget(self.input, 1)
+        
+        self.btn_send = QPushButton("📤 Enviar")
+        self.btn_send.clicked.connect(self.send)
+        input_layout.addWidget(self.btn_send)
+        
+        layout.addLayout(input_layout)
+        
+        # Mensaje inicial
+        self._append_system_message(
+            "👋 ¡Hola! Soy tu asistente de análisis académico.\n\n"
+            "Puedo ayudarte con:\n"
+            "• 📊 Información de grupos de investigación\n"
+            "• 👥 Búsqueda de investigadores y su producción\n"
+            "• 📈 Análisis de tendencias y estadísticas\n"
+            "• 🔍 Búsqueda de productos académicos\n"
+            "• ⚖️ Comparación entre grupos\n"
+            "• ✅ Análisis de cumplimiento\n\n"
+            "Pregunta lo que necesites. Tengo acceso directo a la base de datos."
+        )
+    
+    def _append_system_message(self, text: str):
+        self.chat_view.append(
+            f"<div style='background:#e3f2fd; padding:10px; margin:5px; "
+            f"border-radius:5px; border-left:4px solid #2196f3;'>"
+            f"<b>Sistema:</b><br>{text}</div>"
+        )
+    
+    def _append_user(self, text: str):
+        self.chat_view.append(
+            f"<div style='background:#f5f5f5; padding:10px; margin:5px; "
+            f"border-radius:5px; border-left:4px solid #4caf50;'>"
+            f"<b>Tú:</b> {text}</div>"
+        )
+    
+    def _append_assistant_header(self):
+        self.chat_view.append(
+            "<div style='background:#fff3e0; padding:10px; margin:5px; "
+            "border-radius:5px; border-left:4px solid #ff9800;'>"
+            "<b>Asistente:</b> "
+        )
+    
+    def _append_tool_execution(self, tool_name: str, args: dict):
+        args_str = json.dumps(args, ensure_ascii=False, indent=2)
+        self.chat_view.append(
+            f"<div style='background:#f3e5f5; padding:8px; margin:5px; "
+            f"border-radius:4px; border-left:3px solid #9c27b0; font-size:10px;'>"
+            f"<b>🔧 Ejecutando:</b> <code>{tool_name}</code><br>"
+            f"<pre style='margin:5px 0; font-size:9px;'>{args_str}</pre></div>"
+        )
+    
+    def reset_chat(self):
+        self.chat_view.clear()
+        self.conversation_history = []
+        self._append_system_message("Conversación reiniciada. ¿En qué puedo ayudarte?")
+    
+    def send(self):
+        text = self.input.text().strip()
+        if not text:
+            return
+        
+        self.input.clear()
+        self._append_user(text)
+        self._append_assistant_header()
+        
+        # Construir mensajes
+        messages = self._build_messages(text)
+        
+        # Obtener tools si están activadas
+        tools = None
+        if self.check_tools.isChecked() and self.herramientas_llm:
+            tools = self.herramientas_llm.get_tools_definition()
+        
+        # Deshabilitar input
+        self.btn_send.setEnabled(False)
+        self.input.setEnabled(False)
+        
+        # Iniciar worker
+        model = self.combo_model.currentText().strip()
+        temperature = self.spin_temp.value() / 100.0
+        
+        self.worker = OllamaChatWorker(
+            model=model,
+            messages=messages,
+            tools=tools,
+            temperature=temperature
+        )
+        
+        self.worker.token.connect(self._on_token)
+        self.worker.done.connect(self._on_done)
+        self.worker.error.connect(self._on_error)
+        self.worker.tool_call.connect(self._on_tool_call)
+        
+        self.worker.start()
+    
+    def _build_messages(self, user_text: str):
+        """Construye mensajes para el LLM"""
+        
+        # System prompt
+        system_content = (
+            "Eres un asistente analítico especializado en información académica "
+            "de la Universidad Tecnológica de Pereira.\n\n"
+            "CAPACIDADES:\n"
+            "- Tienes herramientas (functions) para consultar la base de datos en tiempo real\n"
+            "- Puedes obtener información de grupos, investigadores, publicaciones, proyectos\n"
+            "- Debes USAR LAS HERRAMIENTAS cuando necesites datos específicos\n\n"
+            "INSTRUCCIONES:\n"
+            "1. Cuando pregunten sobre datos, USA las herramientas disponibles\n"
+            "2. Responde en español con estructura clara\n"
+            "3. Usa **negritas** para destacar información clave\n"
+            "4. Incluye números y estadísticas cuando los tengas\n"
+            "5. Da recomendaciones accionables basadas en los datos\n"
+            "6. Si no tienes información, sugiere qué herramienta usar\n\n"
+            "FORMATO:\n"
+            "- Usa **negritas** para puntos importantes\n"
+            "- Usa listas con guiones (-) para enumerar\n"
+            "- Sé conciso pero completo\n"
+        )
+        
+        # Agregar contexto de seguimiento
+        if self.check_seguimiento.isChecked() and hasattr(self.vista_seguimiento, 'export_context_for_llm'):
+            try:
+                contexto = self.vista_seguimiento.export_context_for_llm(modo="general")
+                system_content += f"\n\nCONTEXTO SEGUIMIENTO:\n{contexto}\n"
+            except:
+                pass
+        
+        messages = [{"role": "system", "content": system_content}]
+        
+        # Agregar historial (limitado a últimos 10 mensajes)
+        messages.extend(self.conversation_history[-10:])
+        
+        # Agregar mensaje actual
+        messages.append({"role": "user", "content": user_text})
+        
+        return messages
+    
+    def _on_tool_call(self, tool_name: str, arguments: dict):
+        """Maneja ejecución de herramientas"""
+        
+        self._append_tool_execution(tool_name, arguments)
+        
+        if self.herramientas_llm:
+            result = self.herramientas_llm.ejecutar_herramienta(tool_name, arguments)
+            
+            # Mostrar resultado brevemente (opcional)
+            result_preview = result[:200] + "..." if len(result) > 200 else result
+            self.chat_view.append(
+                f"<div style='font-size:9px; color:#666; margin:5px; padding:5px;'>"
+                f"✓ Resultado obtenido ({len(result)} caracteres)</div>"
+            )
+    
+    def _on_token(self, chunk: str):
+        cursor = self.chat_view.textCursor()
+        cursor.movePosition(cursor.End)
+        cursor.insertText(chunk)
+        self.chat_view.setTextCursor(cursor)
+        self.chat_view.ensureCursorVisible()
+    
+    def _on_done(self, full_text: str):
+        self.chat_view.append("</div>")
+        
+        # Guardar en historial
+        # (Simplificado - en producción guardarías user message también)
+        
+        self.btn_send.setEnabled(True)
+        self.input.setEnabled(True)
+        self.input.setFocus()
+    
+    def _on_error(self, error_msg: str):
+        self.chat_view.append(
+            f"<div style='background:#ffebee; padding:10px; margin:5px; "
+            f"border-radius:5px; border-left:4px solid #f44336;'>"
+            f"<b>❌ Error:</b> {error_msg}</div>"
+        )
+        self.btn_send.setEnabled(True)
+        self.input.setEnabled(True)
