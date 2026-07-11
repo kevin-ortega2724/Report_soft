@@ -96,3 +96,7 @@ igual — solo ese botón puntual queda inactivo.
 ## Historial de cambios
 
 Ver [`CHANGELOG.md`](CHANGELOG.md).
+
+## Licencia
+
+Apache License 2.0 — ver [`LICENSE`](LICENSE).
