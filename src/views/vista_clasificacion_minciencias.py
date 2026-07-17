@@ -25,7 +25,19 @@ from utils import (
     get_orden_categoria,
     get_orden_producto,
     normalizar_nombre_hoja,
+    obtener_directorio_base,
 )
+
+
+def _carpeta_gruplac_mas_reciente():
+    """Carpeta data/reporte excel_<fecha> más reciente. Mismo criterio que
+    vista_seguimiento_grupos._carpeta_gruplac_mas_reciente -- el nombre trae
+    la fecha en formato YYYYMMDD, así que ordenar por texto ya da el orden
+    cronológico correcto."""
+    base = obtener_directorio_base() / "data"
+    candidatos = sorted(
+        (p for p in base.glob("reporte excel_*") if p.is_dir()), reverse=True)
+    return candidatos[0] if candidatos else None
 
 
 class ProcesamientoClasificacionThread(QThread):
@@ -304,7 +316,11 @@ class VistaClasificacionMinCiencias(QWidget):
     def __init__(self, db):
         super().__init__()
         self.db = db
-        self.reporte_excel_path = "reports/excel"
+        # "reports/excel" quedó de un scrape viejo (dic-2025) -- usar siempre
+        # el más reciente de data/reporte excel_<fecha> (ver misma nota en
+        # VistaSeguimientoGrupos.__init__).
+        carpeta_reciente = _carpeta_gruplac_mas_reciente()
+        self.reporte_excel_path = str(carpeta_reciente) if carpeta_reciente else "reports/excel"
         self.datos_analisis = None
         self.productos_mostrados = []
         self.thread_procesamiento = None

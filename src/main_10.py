@@ -4,17 +4,17 @@ import re
 import sqlite3
 import sys
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 import pandas as pd
 from pathlib import Path
 from unidecode import unidecode
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
-    QHeaderView, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QProgressBar, QPushButton, QSplitter,
+    QFileDialog, QHeaderView, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QProgressBar, QPushButton, QSpinBox, QSplitter,
     QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit,
     QVBoxLayout, QWidget,
 )
@@ -24,6 +24,8 @@ from views.vista_clasificacion_minciencias import VistaClasificacionMinCiencias
 from views.vista_inicio import VistaInicio
 from views.vista_seguimiento_grupos import VistaSeguimientoGrupos
 from views.vista_simulador_957 import VistaSimulador957
+# from chatbot_investigacion import VistaChatbotInvestigacion  # pestaña retirada por ahora, ver setup_ui
+# from estadisticas_957 import VistaEstadisticas957  # se reconstruye como UI separada en UI_clasificacion/
 from views.vista_visor_gruplac_957 import VisorGrupLAC957
 
 from constants import COLUMNAS_CONOCIDAS_POR_CATEGORIA
@@ -39,6 +41,7 @@ from utils import (
     normalizar_nombre,
     obtener_directorio_base,
 )
+from comparador_faltantes import normalize_text
 
 # ==================== BASE DE DATOS ====================
 
@@ -292,12 +295,27 @@ class DatabaseManager:
         CREATE TABLE IF NOT EXISTS no agrega columnas a tablas ya creadas en
         versiones anteriores de la BD, por eso se necesita este ALTER explícito.
         """
-        tablas = ["publicaciones", "extensiones", "productos_innovacion", "propiedad_intelectual"]
+        tablas = ["publicaciones", "extensiones", "productos_innovacion", "propiedad_intelectual", "trabajos_grado"]
         cursor = self.conn.cursor()
         for tabla in tablas:
             columnas = {fila[1] for fila in cursor.execute(f"PRAGMA table_info({tabla})")}
             if "datos_adicionales" not in columnas:
                 cursor.execute(f"ALTER TABLE {tabla} ADD COLUMN datos_adicionales TEXT")
+
+        # 'origen' distingue si una fila de "grupos" viene directo del
+        # archivo de integrantes ('directo') o fue añadida a partir del
+        # mapeo semillero->grupo adscrito (ver
+        # CargadorDatosIntegrado._grupo_adscrito_semilleros): sin esto, una
+        # membresía sintética (la persona en realidad solo está en el
+        # semillero) es indistinguible de una membresía real al grupo, y los
+        # reportes no podrían avisar "este producto llega por el semillero,
+        # no por el grupo". Filas viejas (anteriores a esta columna) quedan
+        # NULL y se tratan como 'directo' (todas lo eran, el mapeo semillero
+        # no existía todavía).
+        columnas_grupos = {fila[1] for fila in cursor.execute("PRAGMA table_info(grupos)")}
+        if "origen" not in columnas_grupos:
+            cursor.execute("ALTER TABLE grupos ADD COLUMN origen TEXT")
+
         self.conn.commit()
         self._migrar_indices_unicos()
 
@@ -331,6 +349,37 @@ class DatabaseManager:
             cursor.execute(
                 f"CREATE UNIQUE INDEX IF NOT EXISTS ux_{tabla}_dedup ON {tabla}({col_list})"
             )
+        self.conn.commit()
+
+    # ── Fuentes adicionales (archivos que se acumulan sin reemplazar) ──
+
+    def obtener_fuentes_adicionales(self, clave: str) -> list:
+        """Archivos adicionales registrados para una categoría de
+        ARCHIVOS_FUENTE_957 (más allá del archivo canónico), cada uno con
+        su propia ruta única -- se procesan todos, ninguno reemplaza a otro."""
+        row = self.conn.execute(
+            "SELECT valor FROM configuracion WHERE clave = ?",
+            (f"fuentes_adicionales_{clave}",),
+        ).fetchone()
+        if not row:
+            return []
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return []
+
+    def registrar_fuente_adicional(self, clave: str, ruta: str, nombre_original: str):
+        from datetime import datetime
+        fuentes = self.obtener_fuentes_adicionales(clave)
+        fuentes.append({
+            "ruta": ruta,
+            "nombre_original": nombre_original,
+            "fecha_agregado": datetime.now().isoformat(timespec="seconds"),
+        })
+        self.conn.execute(
+            "INSERT OR REPLACE INTO configuracion (clave, valor) VALUES (?, ?)",
+            (f"fuentes_adicionales_{clave}", json.dumps(fuentes)),
+        )
         self.conn.commit()
 
     # ── Caché de carga ───────────────────────────────────────────────────────
@@ -714,6 +763,48 @@ class DatabaseManager:
             ORDER BY p.nombre
         ''', (grupo,)).fetchall()
 
+    def _mapeo_semillero_grupo_adscrito(self):
+        """Mapeo semillero(normalizado) -> grupo adscrito, guardado por
+        CargadorDatosIntegrado._grupo_adscrito_semilleros al procesar
+        'Reporte Semilleros con Grupo adscrito.xlsx'. Cacheado en memoria
+        porque se consulta una vez por producto en los reportes."""
+        if not hasattr(self, '_cache_mapeo_semillero'):
+            fila = self.conn.execute(
+                "SELECT valor FROM configuracion WHERE clave='mapeo_semillero_grupo_adscrito'"
+            ).fetchone()
+            try:
+                self._cache_mapeo_semillero = json.loads(fila[0]) if fila else {}
+            except Exception:
+                self._cache_mapeo_semillero = {}
+        return self._cache_mapeo_semillero
+
+    def procedencia_grupo(self, cedula, grupo):
+        """Para un producto atribuido a 'grupo' por esta 'cedula': ¿la
+        persona pertenece a ese grupo de investigación directamente, solo
+        por un semillero adscrito a él, o por ambos caminos? GrupLAC no
+        rastrea semilleros como entidades propias, así que esta distinción
+        le dice al lector del reporte de dónde sale realmente el producto.
+        Devuelve 'Grupo', 'Semillero' o 'Grupo y Semillero'."""
+        filas = self.conn.execute(
+            "SELECT grupo, origen FROM grupos WHERE cedula = ?", (cedula,)
+        ).fetchall()
+
+        tiene_directo = any(
+            g == grupo and (o is None or o == 'directo') for g, o in filas
+        )
+
+        mapa = self._mapeo_semillero_grupo_adscrito()
+        tiene_semillero = any(
+            "SEMILLERO" in (g or "").upper() and mapa.get(normalize_text(g)) == grupo
+            for g, _ in filas
+        )
+
+        if tiene_directo and tiene_semillero:
+            return "Grupo y Semillero"
+        if tiene_semillero:
+            return "Semillero"
+        return "Grupo"
+
     def obtener_productos_grupo(self, grupo, filtros=None):
         if filtros is None:
             filtros = ['Publicaciones', 'Extensiones', 'Trabajos de Grado', 'Productos Innovación', 'Proyectos']
@@ -787,32 +878,42 @@ class DatabaseManager:
         
         return productos
     
-    def obtener_productos_grupo_detallado(self, grupo, filtros=None):
-        """Versión detallada que retorna diccionarios con toda la información"""
+    def obtener_productos_grupo_detallado(self, grupo, filtros=None, anio_desde=None, anio_hasta=None):
+        """Versión detallada que retorna diccionarios con toda la información.
+        anio_desde/anio_hasta (opcionales): filtran por período: se incluyen los
+        productos con año dentro del rango Y los que no tienen año registrado
+        (para no ocultar datos solo porque falte ese dato)."""
         if filtros is None:
-            filtros = ['Publicaciones', 'Extensiones', 'Trabajos de Grado', 'Productos Innovación', 'Proyectos']
-        
+            filtros = ['Publicaciones', 'Extensiones', 'Trabajos de Grado', 'Productos Innovación',
+                       'Proyectos', 'Propiedad Intelectual']
+
         cursor = self.conn.cursor()
         cedulas = cursor.execute(
             'SELECT DISTINCT cedula FROM grupos WHERE grupo = ?', (grupo,)
         ).fetchall()
-        
+
         if not cedulas:
             return []
-        
+
         cedulas_list = [c[0] for c in cedulas]
         placeholders = ','.join(['?' for _ in cedulas_list])
         productos = []
-        
+
+        filtro_anio_sql = ""
+        params_anio = []
+        if anio_desde is not None and anio_hasta is not None:
+            params_anio = [anio_desde, anio_hasta]
+
         if 'Publicaciones' in filtros:
+            filtro = f" AND (p.año IS NULL OR (p.año >= ? AND p.año <= ?))" if params_anio else ""
             query = f'''
                 SELECT p.*, per.nombre as nombre_investigador
                 FROM publicaciones p
                 JOIN personas per ON p.cedula = per.cedula
-                WHERE p.cedula IN ({placeholders})
+                WHERE p.cedula IN ({placeholders}){filtro}
                 ORDER BY p.año DESC
             '''
-            rows = cursor.execute(query, cedulas_list).fetchall()
+            rows = cursor.execute(query, cedulas_list + params_anio).fetchall()
             for row in rows:
                 productos.append({
                     'cedula': row[1],
@@ -827,19 +928,21 @@ class DatabaseManager:
                     'estado': row[9],
                     'grupo': row[10],
                     'fuente': row[11],
+                    'datos_adicionales': row[12] if len(row) > 13 else None,
                     'tipo_producto': 'Publicación',
                     'detalle': row[3] or ''
                 })
-        
+
         if 'Extensiones' in filtros:
+            filtro = f" AND (e.año IS NULL OR (e.año >= ? AND e.año <= ?))" if params_anio else ""
             query = f'''
                 SELECT e.*, per.nombre as nombre_investigador
                 FROM extensiones e
                 JOIN personas per ON e.cedula = per.cedula
-                WHERE e.cedula IN ({placeholders})
+                WHERE e.cedula IN ({placeholders}){filtro}
                 ORDER BY e.año DESC
             '''
-            rows = cursor.execute(query, cedulas_list).fetchall()
+            rows = cursor.execute(query, cedulas_list + params_anio).fetchall()
             for row in rows:
                 productos.append({
                     'cedula': row[1],
@@ -857,20 +960,30 @@ class DatabaseManager:
                     'financiacion_interna': row[12],
                     'financiacion_externa': row[13],
                     'fuente': row[14],
+                    'datos_adicionales': row[15] if len(row) > 16 else None,
                     'tipo_producto': 'Extensión',
                     'categoria': row[3] or '',
                     'detalle': row[4] or ''
                 })
-        
+
         if 'Trabajos de Grado' in filtros:
+            # Solo "conducentes" (trabajo de grado formal que sí se sube a
+            # GrupLAC): los "no conducentes" (ej. prácticas no conducentes a
+            # título) no cuentan para el reporte del grupo -- solo se
+            # muestran al investigador en Búsqueda Persona. calificacion es
+            # NULL para el reporte institucional de trabajos de grado
+            # posicional (siempre conducente por definición, ese archivo no
+            # trae prácticas).
+            filtro = f" AND (t.año IS NULL OR (t.año >= ? AND t.año <= ?))" if params_anio else ""
+            filtro += " AND (t.calificacion IS NULL OR t.calificacion != 'NO CONDUCENTE')"
             query = f'''
                 SELECT t.*, per.nombre as nombre_director
                 FROM trabajos_grado t
                 JOIN personas per ON t.cedula_director = per.cedula
-                WHERE t.cedula_director IN ({placeholders})
+                WHERE t.cedula_director IN ({placeholders}){filtro}
                 ORDER BY t.año DESC
             '''
-            rows = cursor.execute(query, cedulas_list).fetchall()
+            rows = cursor.execute(query, cedulas_list + params_anio).fetchall()
             for row in rows:
                 productos.append({
                     'cedula': row[1],
@@ -885,20 +998,22 @@ class DatabaseManager:
                     'estudiante': row[4],
                     'cedula_estudiante': row[3],
                     'fuente': row[12],
+                    'datos_adicionales': row[13] if len(row) > 14 else None,
                     'tipo_producto': 'Trabajo de Grado',
                     'categoria': row[6] or '',
                     'detalle': row[4] or ''
                 })
-        
+
         if 'Productos Innovación' in filtros:
+            filtro = f" AND (pi.año IS NULL OR (pi.año >= ? AND pi.año <= ?))" if params_anio else ""
             query = f'''
                 SELECT pi.*, per.nombre as nombre_investigador
                 FROM productos_innovacion pi
                 JOIN personas per ON pi.cedula = per.cedula
-                WHERE pi.cedula IN ({placeholders})
+                WHERE pi.cedula IN ({placeholders}){filtro}
                 ORDER BY pi.año DESC
             '''
-            rows = cursor.execute(query, cedulas_list).fetchall()
+            rows = cursor.execute(query, cedulas_list + params_anio).fetchall()
             for row in rows:
                 productos.append({
                     'cedula': row[1],
@@ -910,20 +1025,22 @@ class DatabaseManager:
                     'estado': row[6],
                     'grupo': row[7],
                     'fuente': row[8],
+                    'datos_adicionales': row[9] if len(row) > 10 else None,
                     'tipo_producto': 'Innovación',
                     'categoria': row[2] or '',
                     'detalle': row[4][:50] + '...' if row[4] and len(row[4]) > 50 else row[4] or ''
                 })
-        
+
         if 'Proyectos' in filtros:
+            filtro = f" AND (pr.año IS NULL OR (pr.año >= ? AND pr.año <= ?))" if params_anio else ""
             query = f'''
                 SELECT pr.*, per.nombre as nombre_investigador
                 FROM proyectos pr
                 JOIN personas per ON pr.cedula = per.cedula
-                WHERE pr.cedula IN ({placeholders})
+                WHERE pr.cedula IN ({placeholders}){filtro}
                 ORDER BY pr.año DESC
             '''
-            rows = cursor.execute(query, cedulas_list).fetchall()
+            rows = cursor.execute(query, cedulas_list + params_anio).fetchall()
             for row in rows:
                 productos.append({
                     'cedula': row[1],
@@ -945,7 +1062,43 @@ class DatabaseManager:
                     'categoria': row[6] or '',
                     'detalle': row[5] or ''
                 })
-        
+
+        if 'Propiedad Intelectual' in filtros:
+            # No tiene cedula propia (queda registrada por nombre en
+            # 'responsable', a veces con varios nombres juntos) -- se asocia
+            # al grupo emparejando ese texto contra los nombres de sus
+            # integrantes ya normalizados (misma normalización que usa el
+            # resto del sistema para nombres).
+            nombres_grupo = cursor.execute(
+                f'SELECT cedula, nombre FROM personas WHERE cedula IN ({placeholders})', cedulas_list
+            ).fetchall()
+            mapa_norm = {normalizar_nombre(nom): ced for ced, nom in nombres_grupo if nom}
+            rows = cursor.execute('SELECT * FROM propiedad_intelectual').fetchall()
+            for row in rows:
+                responsable = row[1] or ''
+                resp_norm = normalizar_nombre(responsable)
+                cedula_match = next((c for n, c in mapa_norm.items() if n and n in resp_norm), None)
+                if not cedula_match:
+                    continue
+                productos.append({
+                    'cedula': cedula_match,
+                    'investigador': responsable,
+                    'titulo': row[4],
+                    'tipo_producto_detalle': row[2],
+                    'tipo_patente': row[3],
+                    'numero_registro': row[5],
+                    'proyecto': row[6],
+                    'fecha_aprobacion': row[7],
+                    'entidad': row[8],
+                    'facultad': row[9],
+                    'fuente': row[10],
+                    'datos_adicionales': row[11] if len(row) > 11 else None,
+                    'año': None,
+                    'tipo_producto': 'Propiedad Intelectual',
+                    'categoria': row[2] or '',
+                    'detalle': row[4] or ''
+                })
+
         return productos
 
     def obtener_estadisticas(self):
@@ -986,7 +1139,47 @@ class CargadorDatosIntegrado(QThread):
         self.db = db
         # self.archivos_directorio = Path(".") Esta estaba anteriormente.
         self.archivos_directorio = obtener_directorio_base()
-    
+
+    # Ver la nota equivalente en loader.py: las categorías de
+    # ARCHIVOS_FUENTE_957 (constants.py) no siempre son 1:1 con los
+    # extractores de aquí -- este mapeo agrupa las claves de categoría que
+    # le corresponden a cada extractor, para sumarles las fuentes
+    # adicionales que el usuario acumuló (sin reemplazar) desde "Agregar
+    # archivo" en Inicio.
+    _CLAVES_POR_EXTRACTOR = {
+        'integrantes': ['integrantes'],
+        'extension': ['extension'],
+        'produccion': ['produccion_2024', 'produccion_2025_ciarp'],
+        'trabajos_grado': ['trabajos_grado'],
+        'libros': ['libros'],
+        'innovacion': ['innovacion'],
+        'proyectos': ['proyectos'],
+        'propiedad_intelectual': ['cgt0104_2025', 'cgt0104_2024'],
+    }
+
+    @staticmethod
+    def _serie_o_vacia(df, columna):
+        """Como df.get(columna, ''), pero el valor por defecto es una Serie
+        vacía ALINEADA al índice de df. pd.Series(dtype=str) suelto tiene su
+        propio índice vacío (longitud 0); si una columna del Excel no existe
+        y se usa ese valor por defecto dentro de un zip() junto a columnas
+        que sí tienen datos, zip() corta TODO el resultado a longitud 0 EN
+        SILENCIO -- así se perdían filas completas (confirmado real: 0
+        publicaciones cargadas desde la BASE DATOS PRODUCCIÓN CIARP porque
+        esa hoja no trae columna 'doi_url'/'doi', y ese único hueco tumbaba
+        las 150 filas del zip entero, sin ningún error visible)."""
+        if columna in df.columns:
+            return df[columna]
+        return pd.Series([''] * len(df), index=df.index)
+
+    def _rutas_adicionales(self, extractor):
+        rutas = []
+        for clave in self._CLAVES_POR_EXTRACTOR.get(extractor, []):
+            for fuente in self.db.obtener_fuentes_adicionales(clave):
+                p = Path(fuente.get("ruta", ""))
+                if p.exists():
+                    rutas.append(p)
+        return rutas
 
     def run(self):
         base = self.archivos_directorio
@@ -1007,6 +1200,8 @@ class CargadorDatosIntegrado(QThread):
             "CGT0104 - No de productos resultados de investigacion 31122024.xlsx",
         ]
         archivos_fuente = [str(base / n) for n in nomina_nombres]
+        for extractor in self._CLAVES_POR_EXTRACTOR:
+            archivos_fuente.extend(str(p) for p in self._rutas_adicionales(extractor))
 
         if self.db.cache_valida(archivos_fuente):
             self.progreso.emit("Base de datos en caché — omitiendo reproceso")
@@ -1026,7 +1221,16 @@ class CargadorDatosIntegrado(QThread):
             # mismo otra vez actualice la fila existente en vez de duplicarla,
             # mientras que las filas realmente nuevas simplemente se acumulan.
 
-            # ── Extracción paralela ──────────────────────────────────────────
+            # ── Extracción secuencial ────────────────────────────────────────
+            # Antes se corría cada extractor en su propio hilo
+            # (ThreadPoolExecutor) para ganar velocidad, pero pandas/openpyxl
+            # no son seguros para lecturas concurrentes de varios .xlsx desde
+            # hilos distintos -- confirmado real: con los archivos actuales
+            # (CIARP + Informe Extensión, ambos de varios MB) la extracción en
+            # paralelo terminaba el proceso Python entero sin ninguna
+            # excepción capturable (crash nativo), mientras que corriendo los
+            # mismos 6 extractores uno tras otro no falla y tarda menos de un
+            # segundo -- no hay necesidad real de paralelismo aquí.
             self.progreso.emit("Extrayendo datos de archivos fuente…")
             extractores = {
                 'integrantes':          self._extraer_integrantes,
@@ -1037,16 +1241,13 @@ class CargadorDatosIntegrado(QThread):
                 'productos_innovacion': self._extraer_productos_innovacion,
             }
             resultados = {}
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                futuros = {pool.submit(fn): name for name, fn in extractores.items()}
-                for futuro in as_completed(futuros):
-                    name = futuros[futuro]
-                    try:
-                        resultados[name] = futuro.result()
-                        self.progreso.emit(f"✓ Extraídos datos de {name}")
-                    except Exception as e:
-                        self.progreso.emit(f"Error extrayendo {name}: {e}")
-                        resultados[name] = ([], [])
+            for name, fn in extractores.items():
+                try:
+                    resultados[name] = fn()
+                    self.progreso.emit(f"✓ Extraídos datos de {name}")
+                except Exception as e:
+                    self.progreso.emit(f"Error extrayendo {name}: {e}")
+                    resultados[name] = ([], [])
 
             # ── Inserción secuencial ─────────────────────────────────────────
             self.progreso.emit("Insertando datos en la base…")
@@ -1060,7 +1261,7 @@ class CargadorDatosIntegrado(QThread):
                 _, grupos_b = resultados['integrantes']
                 if grupos_b:
                     conn.executemany(
-                        'INSERT OR IGNORE INTO grupos (cedula,grupo,facultad,tipo_miembro) VALUES(?,?,?,?)',
+                        'INSERT OR IGNORE INTO grupos (cedula,grupo,facultad,tipo_miembro,origen) VALUES(?,?,?,?,?)',
                         grupos_b,
                     )
                     self.progreso.emit(f"Insertados {len(grupos_b)} integrantes de grupos")
@@ -1096,8 +1297,9 @@ class CargadorDatosIntegrado(QThread):
                     conn.executemany(
                         '''INSERT OR REPLACE INTO trabajos_grado
                            (cedula_director,nombre_director,cedula_estudiante,nombre_estudiante,
-                            titulo,programa,año,calificacion,fecha_sustentacion,facultad,fuente)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
+                            titulo,programa,año,calificacion,fecha_sustentacion,facultad,fuente,
+                            datos_adicionales)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
                         tg_b,
                     )
                     self.progreso.emit(f"Insertados/actualizados {len(tg_b)} trabajos de grado")
@@ -1217,28 +1419,106 @@ class CargadorDatosIntegrado(QThread):
             'Listado Integrantes Grupos de Investigacion UTP - 080825.xlsx',
             'integrantes.xlsx',
         ]
+        rutas = []
         for archivo in archivos:
             ruta = self.archivos_directorio / archivo
-            if not ruta.exists():
-                continue
+            if ruta.exists():
+                rutas.append(ruta)
+                break
+        rutas.extend(self._rutas_adicionales('integrantes'))
+
+        personas_b, grupos_b = [], []
+        for ruta in rutas:
             df = self._normalizar_cols(
                 pd.read_excel(ruta, engine='openpyxl', dtype=str).fillna('')
             )
-            cedulas    = df.get('numero_documento', df.get('cedula', pd.Series(dtype=str))).apply(limpiar_cedula)
-            nombres    = df.get('nombres', df.get('nombre', pd.Series(dtype=str))).apply(limpiar_texto)
-            grupos_s   = df.get('nombre_grupo', df.get('grupo', pd.Series(dtype=str))).apply(limpiar_texto)
-            facultades = df.get('facultad', pd.Series(dtype=str)).apply(limpiar_texto)
-            emails     = df.get('email', pd.Series(dtype=str)).apply(limpiar_texto)
-            tipos      = df.get('tipo', pd.Series(dtype=str)).apply(limpiar_texto)
+            cedulas    = (df['numero_documento'] if 'numero_documento' in df.columns
+                          else self._serie_o_vacia(df, 'cedula')).apply(limpiar_cedula)
+            nombres    = (df['nombres'] if 'nombres' in df.columns
+                          else self._serie_o_vacia(df, 'nombre')).apply(limpiar_texto)
+            grupos_s   = (df['nombre_grupo'] if 'nombre_grupo' in df.columns
+                          else self._serie_o_vacia(df, 'grupo')).apply(limpiar_texto)
+            facultades = self._serie_o_vacia(df, 'facultad').apply(limpiar_texto)
+            emails     = self._serie_o_vacia(df, 'email').apply(limpiar_texto)
+            tipos      = self._serie_o_vacia(df, 'tipo').apply(limpiar_texto)
             mask = (cedulas.str.len() > 0) & (nombres.str.len() > 0)
-            personas_b = list(zip(cedulas[mask], nombres[mask], emails[mask], facultades[mask], tipos[mask]))
-            grupos_b   = [
-                (c, g, f, t)
+            personas_b.extend(zip(cedulas[mask], nombres[mask], emails[mask], facultades[mask], tipos[mask]))
+            grupos_b.extend(
+                (c, g, f, t, 'directo')
                 for c, g, f, t in zip(cedulas[mask], grupos_s[mask], facultades[mask], tipos[mask])
                 if g
-            ]
-            return personas_b, grupos_b
-        return [], []
+            )
+
+        grupos_b.extend(self._grupo_adscrito_semilleros(grupos_b))
+        return personas_b, grupos_b
+
+    def _grupo_adscrito_semilleros(self, grupos_b):
+        """Lee data/Reporte Semilleros con Grupo adscrito.xlsx (columnas
+        NOMBRE SEMILLERO / GRUPO ADSCRITO) y, para cada persona ya registrada
+        bajo un semillero mapeado ahí, agrega TAMBIÉN su membresía al grupo
+        de investigación real al que está adscrito ese semillero. GrupLAC no
+        rastrea semilleros como entidades propias (no tienen carpeta
+        scrapeada) -- sin esto, la producción de alguien que SOLO aparece
+        bajo un semillero (sin membresía directa al grupo real, caso
+        confirmado en ~44 personas) queda sin poder atribuirse a ningún
+        grupo verificable en Seguimiento Grupos ni en Reportes por Grupo.
+
+        Solo se acepta match normalizado EXACTO entre 'grupo adscrito' y un
+        grupo real ya visto en este mismo archivo de integrantes (168/174
+        filas del reporte calzan así) -- los 6 restantes apuntan a grupos
+        que no tienen match confiable (ninguno pasa de 0.76 de similitud
+        contra el grupo interno más parecido) y se descartan en vez de
+        arriesgar una atribución equivocada."""
+        ruta = self.archivos_directorio / "data" / "Reporte Semilleros con Grupo adscrito.xlsx"
+        if not ruta.exists():
+            return []
+
+        grupos_reales_norm = {
+            normalize_text(g): g for (_, g, _, _, _) in grupos_b
+            if "SEMILLERO" not in g.upper()
+        }
+        if not grupos_reales_norm:
+            return []
+
+        try:
+            df = self._normalizar_cols(
+                pd.read_excel(ruta, engine='openpyxl', dtype=str).fillna('')
+            )
+        except Exception:
+            return []
+
+        nombres_semillero = self._serie_o_vacia(df, 'nombre_semillero').apply(limpiar_texto)
+        adscritos = self._serie_o_vacia(df, 'grupo_adscrito').apply(limpiar_texto)
+
+        mapa = {}
+        for nombre, adscrito in zip(nombres_semillero, adscritos):
+            if not nombre or not adscrito:
+                continue
+            real = grupos_reales_norm.get(normalize_text(adscrito))
+            if real:
+                mapa[normalize_text(nombre)] = real
+
+        if not mapa:
+            return []
+
+        # Persistido para que los reportes (Reportes por Grupo) puedan
+        # más tarde preguntar "¿esta persona también participa en un
+        # semillero adscrito a este grupo?" sin tener que releer el Excel --
+        # ver DatabaseManager.procedencia_grupo.
+        self.db.conn.execute(
+            "INSERT OR REPLACE INTO configuracion (clave, valor) VALUES (?, ?)",
+            ("mapeo_semillero_grupo_adscrito", json.dumps(mapa, ensure_ascii=False)),
+        )
+        self.db.conn.commit()
+
+        vistos = {(c, g) for c, g, _, _, _ in grupos_b}
+        extra = []
+        for cedula, grupo, facultad, tipo, _origen in grupos_b:
+            real = mapa.get(normalize_text(grupo))
+            if real and (cedula, real) not in vistos:
+                vistos.add((cedula, real))
+                extra.append((cedula, real, facultad, tipo, 'semillero'))
+        return extra
 
     def cargar_integrantes(self):
         self.progreso.emit('Cargando integrantes de grupos...')
@@ -1247,7 +1527,7 @@ class CargadorDatosIntegrado(QThread):
             conn = self.db.conn
             self.db._upsert_personas_batch(personas_b)
             conn.executemany(
-                'INSERT OR IGNORE INTO grupos (cedula,grupo,facultad,tipo_miembro) VALUES(?,?,?,?)',
+                'INSERT OR IGNORE INTO grupos (cedula,grupo,facultad,tipo_miembro,origen) VALUES(?,?,?,?,?)',
                 grupos_b,
             )
             conn.commit()
@@ -1260,50 +1540,133 @@ class CargadorDatosIntegrado(QThread):
             'Actividades Extensión enerojulio.xlsx',
             'Actividades Extensión (enero-julio).xlsx',
         ]
-        personas_b, ext_b = [], []
+        rutas = []
         for archivo in archivos:
             ruta = self.archivos_directorio / archivo
-            if not ruta.exists():
+            if ruta.exists():
+                rutas.append(ruta)
+        rutas.extend(self._rutas_adicionales('extension'))
+
+        personas_b, ext_b = [], []
+        for ruta in rutas:
+            # "Informe Extensión" (fuente adicional, ej. el que exporta el
+            # sistema de Extensión de la universidad) trae una hoja 'Datos'
+            # con encabezados propios en vez de 'Consolidado' -- sin este
+            # chequeo, pd.read_excel(sheet_name='Consolidado') lanzaba
+            # ValueError (hoja inexistente) y la excepción, atrapada en
+            # silencio por el ThreadPoolExecutor de run(), tumbaba TODA la
+            # categoría "extensiones" (incluida la institucional) en vez de
+            # solo saltarse el archivo con formato distinto.
+            try:
+                xls = pd.ExcelFile(ruta, engine='openpyxl')
+            except Exception:
                 continue
+            if 'Consolidado' not in xls.sheet_names:
+                if 'Datos' in xls.sheet_names:
+                    p_b, e_b = self._extraer_extension_informe(ruta)
+                    personas_b.extend(p_b)
+                    ext_b.extend(e_b)
+                continue
+
             df = self._normalizar_cols(
-                pd.read_excel(ruta, sheet_name='Consolidado', engine='openpyxl', dtype=str).fillna('')
+                pd.read_excel(xls, sheet_name='Consolidado', dtype=str).fillna('')
             )
 
-            cedulas = df.get('cedula', pd.Series(dtype=str)).apply(limpiar_cedula)
+            cedulas = self._serie_o_vacia(df, 'cedula').apply(limpiar_cedula)
             mask = cedulas.str.len() > 0
             if not mask.any():
                 continue
 
             dv = df[mask]
             cv = cedulas[mask]
-            nombres   = dv.get('nombre_responsable', pd.Series(dtype=str)).apply(limpiar_texto).replace('', 'Sin nombre')
-            facultades = (dv.get('facultad_dependencia') if 'facultad_dependencia' in dv.columns
-                          else dv.get('facultad', pd.Series(dtype=str))).apply(limpiar_texto)
-            fis       = dv.get('fecha_inicial', pd.Series(dtype=str)).astype(str)
+            nombres   = self._serie_o_vacia(dv, 'nombre_responsable').apply(limpiar_texto).replace('', 'Sin nombre')
+            facultades = (dv['facultad_dependencia'] if 'facultad_dependencia' in dv.columns
+                          else self._serie_o_vacia(dv, 'facultad')).apply(limpiar_texto)
+            fis       = self._serie_o_vacia(dv, 'fecha_inicial').astype(str)
             anios     = fis.str[:4].apply(self._anio)
 
-            grupos_s  = (dv.get('grupo_semillero_de_investigacion') if 'grupo_semillero_de_investigacion' in dv.columns
-                         else dv.get('grupo', pd.Series(dtype=str))).apply(limpiar_texto)
+            grupos_s  = (dv['grupo_semillero_de_investigacion'] if 'grupo_semillero_de_investigacion' in dv.columns
+                         else self._serie_o_vacia(dv, 'grupo')).apply(limpiar_texto)
             extra     = self._columnas_extra_json(dv, COLUMNAS_CONOCIDAS_POR_CATEGORIA['extension'])
 
             personas_b.extend(zip(cv, nombres, pd.Series('', index=dv.index), facultades, pd.Series('Responsable', index=dv.index)))
             ext_b.extend(zip(
                 cv,
-                dv.get('nombre_actividad', pd.Series(dtype=str)).apply(limpiar_texto),
-                dv.get('tipo', pd.Series(dtype=str)).apply(limpiar_texto),
-                dv.get('modalidad', pd.Series(dtype=str)).apply(limpiar_texto),
-                dv.get('estado', pd.Series(dtype=str)).apply(limpiar_texto),
+                self._serie_o_vacia(dv, 'nombre_actividad').apply(limpiar_texto),
+                self._serie_o_vacia(dv, 'tipo').apply(limpiar_texto),
+                self._serie_o_vacia(dv, 'modalidad').apply(limpiar_texto),
+                self._serie_o_vacia(dv, 'estado').apply(limpiar_texto),
                 fis,
-                dv.get('fecha_final', pd.Series(dtype=str)).apply(limpiar_texto),
+                self._serie_o_vacia(dv, 'fecha_final').apply(limpiar_texto),
                 anios,
-                dv.get('poblacion_beneficiaria', pd.Series(dtype=str)).apply(limpiar_texto),
+                self._serie_o_vacia(dv, 'poblacion_beneficiaria').apply(limpiar_texto),
                 grupos_s,
                 facultades,
-                dv.get('financiacion_interna', pd.Series(dtype=str)).apply(limpiar_texto),
-                dv.get('fuente_financiacion_externa', pd.Series(dtype=str)).apply(limpiar_texto),
-                [archivo] * len(dv),
+                self._serie_o_vacia(dv, 'financiacion_interna').apply(limpiar_texto),
+                self._serie_o_vacia(dv, 'fuente_financiacion_externa').apply(limpiar_texto),
+                [ruta.name] * len(dv),
                 extra,
             ))
+        return personas_b, ext_b
+
+    def _extraer_extension_informe(self, ruta):
+        """Lee un 'Informe Extensión' con hoja 'Datos' (formato distinto al
+        institucional 'Consolidado Extensión NNNN.xlsx': encabezados propios
+        como 'Grupo(s) de investigación', 'Fecha inicial'/'Fecha final',
+        'Número documento', 'Nombre responsable'...) y lo mapea a la tabla
+        extensiones. Columnas no usadas explícitamente (objetivo, duración,
+        resultados obtenidos, beneficiados, correo, id) se guardan en
+        'datos_adicionales' para no perderlas."""
+        df = self._normalizar_cols(
+            pd.read_excel(ruta, sheet_name='Datos', engine='openpyxl', dtype=str).fillna('')
+        )
+
+        cedulas = self._serie_o_vacia(df, 'numero_documento').apply(limpiar_cedula)
+        mask = cedulas.str.len() > 0
+        if not mask.any():
+            return [], []
+
+        dv = df[mask]
+        cv = cedulas[mask]
+        nombres = self._serie_o_vacia(dv, 'nombre_responsable').apply(limpiar_texto).replace('', 'Sin nombre')
+        facultades = self._serie_o_vacia(dv, 'facultad_dependencia').apply(limpiar_texto)
+        fis = self._serie_o_vacia(dv, 'fecha_inicial').astype(str)
+        anios = fis.str[:4].apply(self._anio)
+        grupos_s = self._serie_o_vacia(dv, 'grupo_s__de_investigacion').apply(limpiar_texto)
+
+        columnas_conocidas = {
+            'numero_documento', 'nombre_responsable', 'facultad_dependencia',
+            'fecha_inicial', 'fecha_final', 'grupo_s__de_investigacion',
+            'nombre', 'tipo', 'modalidad', 'estado', 'poblacion_beneficiaria',
+        }
+        columnas_extra = [c for c in dv.columns if c not in columnas_conocidas]
+        extra = [
+            json.dumps(datos, ensure_ascii=False) if datos else ''
+            for datos in (
+                {c: limpiar_texto(fila[c]) for c in columnas_extra if limpiar_texto(fila[c])}
+                for _, fila in dv.iterrows()
+            )
+        ]
+
+        personas_b = list(zip(cv, nombres, pd.Series('', index=dv.index), facultades,
+                               pd.Series('Responsable', index=dv.index)))
+        ext_b = list(zip(
+            cv,
+            self._serie_o_vacia(dv, 'nombre').apply(limpiar_texto),
+            self._serie_o_vacia(dv, 'tipo').apply(limpiar_texto),
+            self._serie_o_vacia(dv, 'modalidad').apply(limpiar_texto),
+            self._serie_o_vacia(dv, 'estado').apply(limpiar_texto),
+            fis,
+            self._serie_o_vacia(dv, 'fecha_final').apply(limpiar_texto),
+            anios,
+            self._serie_o_vacia(dv, 'poblacion_beneficiaria').apply(limpiar_texto),
+            grupos_s,
+            facultades,
+            pd.Series('', index=dv.index),
+            pd.Series('', index=dv.index),
+            [ruta.name] * len(dv),
+            extra,
+        ))
         return personas_b, ext_b
 
     def cargar_extensiones(self):
@@ -1330,49 +1693,53 @@ class CargadorDatosIntegrado(QThread):
             'BASE DATOS PRODUCCIÓN  2025  CIARP.xlsx',
             'BASE DATOS PRODUCCIÓN  2025 - CIARP.xlsx',
         ]
-        personas_b, pub_b = [], []
+        rutas = []
         for archivo in archivos:
             ruta = self.archivos_directorio / archivo
-            if not ruta.exists():
-                continue
+            if ruta.exists():
+                rutas.append(ruta)
+        rutas.extend(self._rutas_adicionales('produccion'))
+
+        personas_b, pub_b = [], []
+        for ruta in rutas:
             xls = pd.ExcelFile(ruta, engine='openpyxl')
             for sheet in xls.sheet_names:
                 df = self._normalizar_cols(
                     pd.read_excel(xls, sheet_name=sheet, dtype=str).fillna('')
                 )
 
-                cedulas = df.get('cedula', pd.Series(dtype=str)).apply(limpiar_cedula)
+                cedulas = self._serie_o_vacia(df, 'cedula').apply(limpiar_cedula)
                 mask = cedulas.str.len() > 0
                 if not mask.any():
                     continue
 
                 dv = df[mask]
                 cv = cedulas[mask]
-                nombres   = (dv.get('autores') if 'autores' in dv.columns
-                             else dv.get('autor') if 'autor' in dv.columns
-                             else dv.get('nombre', pd.Series(dtype=str))).apply(limpiar_texto)
-                facultades = (dv.get('dependencia') if 'dependencia' in dv.columns
-                              else dv.get('facultad', pd.Series(dtype=str))).apply(limpiar_texto)
+                nombres   = (dv['autores'] if 'autores' in dv.columns
+                             else dv['autor'] if 'autor' in dv.columns
+                             else self._serie_o_vacia(dv, 'nombre')).apply(limpiar_texto)
+                facultades = (dv['dependencia'] if 'dependencia' in dv.columns
+                              else self._serie_o_vacia(dv, 'facultad')).apply(limpiar_texto)
                 extra = self._columnas_extra_json(dv, COLUMNAS_CONOCIDAS_POR_CATEGORIA['produccion_2024'])
 
-                fuente = f'{archivo} :: {sheet}'
+                fuente = f'{ruta.name} :: {sheet}'
                 personas_b.extend(zip(cv, nombres, pd.Series('', index=dv.index), facultades, pd.Series('Autor', index=dv.index)))
                 pub_b.extend(zip(
                     cv,
-                    (dv.get('nombre_del_trabajo') if 'nombre_del_trabajo' in dv.columns
-                     else dv.get('titulo', pd.Series(dtype=str))).apply(limpiar_texto),
-                    (dv.get('revista_o_libro') if 'revista_o_libro' in dv.columns
-                     else dv.get('revista_libro', pd.Series(dtype=str))).apply(limpiar_texto),
-                    (dv.get('doi_url') if 'doi_url' in dv.columns
-                     else dv.get('doi', pd.Series(dtype=str))).apply(limpiar_texto),
-                    (dv.get('issn_isbn') if 'issn_isbn' in dv.columns
-                     else dv.get('issn', pd.Series(dtype=str))).apply(limpiar_texto),
-                    (dv.get('ano_de_la_publicacion') if 'ano_de_la_publicacion' in dv.columns
-                     else dv.get('ano', pd.Series(dtype=str))).apply(self._anio),
-                    dv.get('tipo', pd.Series(dtype=str)).apply(limpiar_texto),
-                    dv.get('categoria', pd.Series(dtype=str)).apply(limpiar_texto),
-                    dv.get('estado', pd.Series(dtype=str)).apply(limpiar_texto),
-                    dv.get('grupo', pd.Series(dtype=str)).apply(limpiar_texto),
+                    (dv['nombre_del_trabajo'] if 'nombre_del_trabajo' in dv.columns
+                     else self._serie_o_vacia(dv, 'titulo')).apply(limpiar_texto),
+                    (dv['revista_o_libro'] if 'revista_o_libro' in dv.columns
+                     else self._serie_o_vacia(dv, 'revista_libro')).apply(limpiar_texto),
+                    (dv['doi_url'] if 'doi_url' in dv.columns
+                     else self._serie_o_vacia(dv, 'doi')).apply(limpiar_texto),
+                    (dv['issn_isbn'] if 'issn_isbn' in dv.columns
+                     else self._serie_o_vacia(dv, 'issn')).apply(limpiar_texto),
+                    (dv['ano_de_la_publicacion'] if 'ano_de_la_publicacion' in dv.columns
+                     else self._serie_o_vacia(dv, 'ano')).apply(self._anio),
+                    self._serie_o_vacia(dv, 'tipo').apply(limpiar_texto),
+                    self._serie_o_vacia(dv, 'categoria').apply(limpiar_texto),
+                    self._serie_o_vacia(dv, 'estado').apply(limpiar_texto),
+                    self._serie_o_vacia(dv, 'grupo').apply(limpiar_texto),
                     [fuente] * len(dv),
                     extra,
                 ))
@@ -1401,11 +1768,14 @@ class CargadorDatosIntegrado(QThread):
             'TrabajosGrado_TrabajoDeGrado 2024.xlsx',
             'Trabajos Grado - Trabajo de Grado.xlsx',
         ]
-        personas_b, tg_b = [], []
+        rutas = []
         for archivo in archivos:
             ruta = self.archivos_directorio / archivo
-            if not ruta.exists():
-                continue
+            if ruta.exists():
+                rutas.append(ruta)
+
+        personas_b, tg_b = [], []
+        for ruta in rutas:
             df = pd.read_excel(ruta, engine='openpyxl', header=None)
             director_actual = cedula_director = None
             for row in df.itertuples(index=False):
@@ -1443,8 +1813,83 @@ class CargadorDatosIntegrado(QThread):
                         limpiar_texto(str(row[4]) if len(row) > 4 and pd.notna(row[4]) else ''),
                         fecha,
                         limpiar_texto(str(row[6]) if len(row) > 6 and pd.notna(row[6]) else ''),
-                        archivo,
+                        ruta.name,
+                        '',
                     ))
+
+        # Fuentes adicionales (ej. reportes de prácticas): tienen encabezado
+        # de columna propio, muy distinto del reporte institucional posicional
+        # de arriba, así que se leen por nombre de columna en vez de por
+        # posición fija -- ver _extraer_practicas().
+        for ruta_extra in self._rutas_adicionales('trabajos_grado'):
+            p_b, tg_extra = self._extraer_practicas(ruta_extra)
+            personas_b.extend(p_b)
+            tg_b.extend(tg_extra)
+
+        return personas_b, tg_b
+
+    def _extraer_practicas(self, ruta):
+        """Lee un reporte de prácticas (encabezados tipo 'Código Estudiante',
+        'Nombre del Estudiante', 'Escenario de Práctica', 'Nombre de la
+        Práctica', 'Cédula/Nombre Docente Guía', etc.) y lo mapea a la tabla
+        trabajos_grado: el docente guía cuenta como 'director', la práctica
+        como el 'título'. Cualquier columna que no se use explícitamente
+        (escenario, NIT, ciudad, modalidad, fecha de inicio...) se guarda
+        completa en 'datos_adicionales' para no perderla."""
+        df = self._normalizar_cols(
+            pd.read_excel(ruta, engine='openpyxl', dtype=str).fillna('')
+        )
+
+        def _col(*claves):
+            for c in claves:
+                if c in df.columns:
+                    return df[c]
+            return pd.Series([''] * len(df), index=df.index)
+
+        cedulas_docente = _col('cedula_docente_guia', 'cedula_docente', 'documento_docente_guia').apply(limpiar_cedula)
+        nombres_docente = _col('nombre_docente_guia', 'docente_guia').apply(limpiar_texto)
+        cedulas_estudiante = _col('codigo_estudiante', 'codigo_estudia', 'documento_estudiante', 'cedula_estudiante').apply(limpiar_cedula)
+        nombres_estudiante = _col('nombre_del_estudiante', 'nombre_estudiante').apply(limpiar_texto)
+        titulos = _col('nombre_de_la_practica', 'nombre_practica').apply(limpiar_texto)
+        programas = _col('programa_academico', 'programa').apply(limpiar_texto)
+        facultades = _col('facultad').apply(limpiar_texto)
+        tipos_practica = _col('tipo_de_practica', 'tipo_practica').apply(limpiar_texto)
+        fechas_fin = _col('fecha_de_finalizacion', 'fecha_finalizacion').apply(limpiar_texto)
+        fechas_inicio = _col('fecha_de_inicio', 'fecha_inicio').apply(limpiar_texto)
+
+        columnas_conocidas = COLUMNAS_CONOCIDAS_POR_CATEGORIA.get('trabajos_grado', set())
+        columnas_extra = [c for c in df.columns if c not in columnas_conocidas]
+
+        personas_b, tg_b = [], []
+        for i in range(len(df)):
+            titulo = titulos.iloc[i]
+            cedula_est = cedulas_estudiante.iloc[i]
+            if not titulo or not cedula_est:
+                continue
+            cedula_doc = cedulas_docente.iloc[i]
+            nombre_doc = nombres_docente.iloc[i]
+
+            año = None
+            for fecha in (fechas_fin.iloc[i], fechas_inicio.iloc[i]):
+                if fecha:
+                    try:
+                        año = int(fecha.split('-')[0]) if '-' in fecha else int(str(fecha).split('/')[-1])
+                        break
+                    except (ValueError, IndexError):
+                        pass
+
+            if cedula_doc:
+                personas_b.append((cedula_doc, nombre_doc, '', facultades.iloc[i], 'Director'))
+
+            fila = df.iloc[i]
+            datos_extra = {c: limpiar_texto(fila[c]) for c in columnas_extra if limpiar_texto(fila[c])}
+            extra_json = json.dumps(datos_extra, ensure_ascii=False) if datos_extra else ''
+
+            tg_b.append((
+                cedula_doc, nombre_doc, cedula_est, nombres_estudiante.iloc[i],
+                titulo, programas.iloc[i], año, tipos_practica.iloc[i],
+                fechas_fin.iloc[i], facultades.iloc[i], ruta.name, extra_json,
+            ))
         return personas_b, tg_b
 
     def cargar_trabajos_grado(self):
@@ -1469,11 +1914,15 @@ class CargadorDatosIntegrado(QThread):
             'Reporte de libros y capítulos publicados.xlsx',
             'Reporte_libros.xlsx',
         ]
-        personas_b, pub_b = [], []
+        rutas = []
         for archivo in archivos:
             ruta = self.archivos_directorio / archivo
-            if not ruta.exists():
-                continue
+            if ruta.exists():
+                rutas.append(ruta)
+        rutas.extend(self._rutas_adicionales('libros'))
+
+        personas_b, pub_b = [], []
+        for ruta in rutas:
             df = pd.read_excel(ruta, engine='openpyxl', header=None)
             titulo_actual = tipo_actual = None
             autores_libro = []
@@ -1482,7 +1931,7 @@ class CargadorDatosIntegrado(QThread):
                 for aut in autores_libro:
                     pub_b.append((
                         aut['cedula'], titulo_actual, '', '', '', None,
-                        'LIBRO', tipo_actual or 'LIBRO', '', '', archivo,
+                        'LIBRO', tipo_actual or 'LIBRO', '', '', ruta.name,
                     ))
 
             for row in df.itertuples(index=False):
@@ -1520,35 +1969,40 @@ class CargadorDatosIntegrado(QThread):
     # ── Productos de innovación ───────────────────────────────────────
     def _extraer_productos_innovacion(self):
         ruta = self.archivos_directorio / 'info_productos_innovacion.xlsx'
-        if not ruta.exists():
+        rutas = [ruta] if ruta.exists() else []
+        rutas.extend(self._rutas_adicionales('innovacion'))
+        if not rutas:
             return [], []
-        df = self._normalizar_cols(
-            pd.read_excel(ruta, engine='openpyxl', dtype=str).fillna('')
-        )
-        nombres = (df.get('nombre') if 'nombre' in df.columns
-                   else df.get('titulo') if 'titulo' in df.columns
-                   else df.get('producto', pd.Series(dtype=str))).apply(limpiar_texto)
-        mask = nombres.str.len() > 0
-        if not mask.any():
-            return [], []
-        dv = df[mask]
-        nv = nombres[mask]
-        anios = (dv.get('ano_de_registro') if 'ano_de_registro' in dv.columns
-                 else dv.get('ano', pd.Series(dtype=str))).apply(self._anio)
-        extra = self._columnas_extra_json(dv, COLUMNAS_CONOCIDAS_POR_CATEGORIA['innovacion'])
-        batch = list(zip(
-            ['0000000'] * len(dv),
-            (dv.get('tipo_de_producto') if 'tipo_de_producto' in dv.columns
-             else dv.get('tipo', pd.Series(dtype=str))).apply(limpiar_texto),
-            nv,
-            dv.get('descripcion', pd.Series(dtype=str)).apply(limpiar_texto),
-            anios,
-            dv.get('estado', pd.Series(dtype=str)).apply(limpiar_texto),
-            (dv.get('grupo_de_investigacion') if 'grupo_de_investigacion' in dv.columns
-             else dv.get('grupo', pd.Series(dtype=str))).apply(limpiar_texto),
-            ['info_productos_innovacion.xlsx'] * len(dv),
-            extra,
-        ))
+
+        batch = []
+        for ruta in rutas:
+            df = self._normalizar_cols(
+                pd.read_excel(ruta, engine='openpyxl', dtype=str).fillna('')
+            )
+            nombres = (df['nombre'] if 'nombre' in df.columns
+                       else df['titulo'] if 'titulo' in df.columns
+                       else self._serie_o_vacia(df, 'producto')).apply(limpiar_texto)
+            mask = nombres.str.len() > 0
+            if not mask.any():
+                continue
+            dv = df[mask]
+            nv = nombres[mask]
+            anios = (dv['ano_de_registro'] if 'ano_de_registro' in dv.columns
+                     else self._serie_o_vacia(dv, 'ano')).apply(self._anio)
+            extra = self._columnas_extra_json(dv, COLUMNAS_CONOCIDAS_POR_CATEGORIA['innovacion'])
+            batch.extend(zip(
+                ['0000000'] * len(dv),
+                (dv['tipo_de_producto'] if 'tipo_de_producto' in dv.columns
+                 else self._serie_o_vacia(dv, 'tipo')).apply(limpiar_texto),
+                nv,
+                self._serie_o_vacia(dv, 'descripcion').apply(limpiar_texto),
+                anios,
+                self._serie_o_vacia(dv, 'estado').apply(limpiar_texto),
+                (dv['grupo_de_investigacion'] if 'grupo_de_investigacion' in dv.columns
+                 else self._serie_o_vacia(dv, 'grupo')).apply(limpiar_texto),
+                [ruta.name] * len(dv),
+                extra,
+            ))
         return [], batch
 
     def cargar_productos_innovacion(self):
@@ -1576,20 +2030,20 @@ class CargadorDatosIntegrado(QThread):
             "proyectos 2024.xlsx"
         ]
         
-        archivo_encontrado = None
+        rutas = []
         for archivo in archivos_posibles:
             ruta = self.archivos_directorio / archivo
             if ruta.exists():
-                archivo_encontrado = archivo
+                rutas.append(ruta)
                 break
-        
-        if not archivo_encontrado:
+        rutas.extend(self._rutas_adicionales('proyectos'))
+
+        if not rutas:
             self.progreso.emit("⚠ No se encontró archivo de proyectos de investigación")
             return
-        
-        ruta = self.archivos_directorio / archivo_encontrado
-        
-        try:
+
+        for ruta in rutas:
+          try:
             # USAR DETECCIÓN AUTOMÁTICA DE ENCABEZADOS (como investigacion.py)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
@@ -1601,26 +2055,52 @@ class CargadorDatosIntegrado(QThread):
             hdr_row = self._find_header_row_proyectos(df_raw)
             
             if hdr_row is None:
-                self.progreso.emit(f"⚠ No se detectó encabezado en {archivo_encontrado}. Intentando lectura estándar...")
+                self.progreso.emit(f"⚠ No se detectó encabezado en {ruta.name}. Intentando lectura estándar...")
                 # Intento con lectura normal
                 df = pd.read_excel(ruta, engine='openpyxl')
+                filas_a_procesar = list(df.iterrows())
             else:
                 self.progreso.emit(f"✓ Encabezado detectado en fila {hdr_row+1}")
-                
+
                 # Mapear columnas
                 colmap = self._pick_columns_proyectos(df_raw.iloc[hdr_row, :])
                 self.progreso.emit(f"Columnas detectadas: {sum(1 for v in colmap.values() if v is not None)}/{len(colmap)}")
-                
-                # Construir DataFrame
-                df = pd.DataFrame()
-                for col_name, col_idx in colmap.items():
-                    if col_idx is not None:
-                        df[col_name] = df_raw.iloc[hdr_row+1:, col_idx].astype(str).str.strip()
-            
+
+                # Layout de bloque: algunos reportes traen el proyecto y su
+                # primer integrante en la misma fila, y los DEMÁS integrantes
+                # en filas siguientes con los campos del proyecto en blanco
+                # (viven solo en la fila del bloque) -- confirmado real:
+                # "Proyectos ... 2025 a 30062026" trae hasta varios
+                # integrantes adicionales por proyecto en filas separadas.
+                # Sin "arrastrar" los campos del proyecto hacia abajo, esas
+                # filas de integrante quedaban sin título (se descartaban
+                # con el "if not titulo" de más abajo) y se perdían todos los
+                # coautores salvo el primero.
+                campos_proyecto = ['TITULO', 'OBJETIVO', 'CODIGO_CIE', 'ANIO', 'FECHA_INICIO',
+                                    'FECHA_FINAL', 'ESTADO', 'TIPO_INV', 'FACULTAD', 'GRUPO',
+                                    'VALOR_APROBADO']
+
+                def _valor_col(fila_raw, campo):
+                    idx = colmap.get(campo)
+                    if idx is None or idx >= len(fila_raw):
+                        return ''
+                    return limpiar_texto(fila_raw.iloc[idx])
+
+                filas_a_procesar = []
+                actual = {campo: '' for campo in campos_proyecto}
+                for i in range(hdr_row + 1, len(df_raw)):
+                    fila_raw = df_raw.iloc[i]
+                    if _valor_col(fila_raw, 'TITULO'):
+                        actual = {campo: _valor_col(fila_raw, campo) for campo in campos_proyecto}
+                    fila = dict(actual)
+                    fila['RESPONSABLE'] = _valor_col(fila_raw, 'RESPONSABLE')
+                    fila['CEDULA'] = _valor_col(fila_raw, 'CEDULA')
+                    filas_a_procesar.append((i, fila))
+
             count = 0
-            for _, row in df.iterrows():
+            for _, row in filas_a_procesar:
                 # Obtener campos (ahora con nombres normalizados si usó detección)
-                if 'RESPONSABLE' in df.columns:
+                if hdr_row is not None:
                     responsable = limpiar_texto(row.get('RESPONSABLE', ''))
                     cedula = limpiar_cedula(row.get('CEDULA', ''))
                     titulo = limpiar_texto(row.get('TITULO', ''))
@@ -1685,15 +2165,15 @@ class CargadorDatosIntegrado(QThread):
                 ''', (
                     cedula_principal, responsable, titulo, objetivo, codigo_cie, 
                     tipo, año, fecha_inicio, fecha_fin, estado, facultad, 
-                    grupo, valor, archivo_encontrado
+                    grupo, valor, ruta.name
                 ))
                 count += 1
             
             self.db.conn.commit()
-            self.progreso.emit(f"✓ Cargados {count} proyectos de investigación desde {archivo_encontrado}")
-        except Exception as e:
-            self.progreso.emit(f"Error en proyectos: {str(e)}")
-    
+            self.progreso.emit(f"✓ Cargados {count} proyectos de investigación desde {ruta.name}")
+          except Exception as e:
+            self.progreso.emit(f"Error en proyectos ({ruta.name}): {str(e)}")
+
     def _find_header_row_proyectos(self, df: pd.DataFrame, max_scan: int = 50) -> int:
         """Detecta la fila de encabezados en proyectos"""
         keys_any = {"responsable", "responsables", "investigador principal"}
@@ -1757,12 +2237,15 @@ class CargadorDatosIntegrado(QThread):
             "CGT0104  No de productos resultados de investigacion 31122024.xlsx"
         ]
         
-        count = 0
+        rutas = []
         for archivo in archivos_posibles:
             ruta = self.archivos_directorio / archivo
-            if not ruta.exists():
-                continue
-            
+            if ruta.exists():
+                rutas.append(ruta)
+        rutas.extend(self._rutas_adicionales('propiedad_intelectual'))
+
+        count = 0
+        for ruta in rutas:
             try:
                 wb = pd.ExcelFile(ruta, engine='openpyxl')
                 for sheet_name in wb.sheet_names:
@@ -1807,14 +2290,14 @@ class CargadorDatosIntegrado(QThread):
                                 limpiar_texto(row.get('Fecha de aprobación') or ''),
                                 limpiar_texto(row.get('Entidad que lo expide') or ''),
                                 limpiar_texto(row.get('Facultad') or ''),
-                                f"{archivo} :: {sheet_name}",
+                                f"{ruta.name} :: {sheet_name}",
                                 extra_json,
                             ))
                             count += 1
-                
+
                 self.db.conn.commit()
             except Exception as e:
-                self.progreso.emit(f"Error en {archivo}: {str(e)}")
+                self.progreso.emit(f"Error en {ruta.name}: {str(e)}")
         
         if count > 0:
             self.progreso.emit(f"Cargados {count} registros de propiedad intelectual")
@@ -2073,9 +2556,17 @@ class VistaBusqueda(QWidget):
                 "#f18f01", items
             )
 
+        def _badge_conducente(calificacion):
+            cal = (calificacion or "").strip().upper()
+            if cal == "NO CONDUCENTE":
+                return " <span style='background:#f4d1d1;color:#8a2b2b;border-radius:3px;padding:1px 5px;font-size:10px;'>NO CONDUCENTE</span>"
+            if cal == "CONDUCENTE":
+                return " <span style='background:#d4ecd8;color:#1e6b3a;border-radius:3px;padding:1px 5px;font-size:10px;'>CONDUCENTE</span>"
+            return ""
+
         if detalle.get("trabajos_grado_director"):
             items = "".join(
-                f"<p style='margin:2px 0;'>&#9679; <b>{_s(tg[5])[:100]}</b><br>"
+                f"<p style='margin:2px 0;'>&#9679; <b>{_s(tg[5])[:100]}</b>{_badge_conducente(tg[10])}<br>"
                 f"<span style='color:#555;'>Estudiante: {_s(tg[4])} | Prog: {_s(tg[6])} | "
                 f"Año: {_s(tg[7])}</span></p>"
                 for tg in detalle["trabajos_grado_director"]
@@ -2087,7 +2578,7 @@ class VistaBusqueda(QWidget):
 
         if detalle.get("trabajos_grado_estudiante"):
             items = "".join(
-                f"<p style='margin:2px 0;'>&#9679; <b>{_s(tg[5])[:100]}</b><br>"
+                f"<p style='margin:2px 0;'>&#9679; <b>{_s(tg[5])[:100]}</b>{_badge_conducente(tg[10])}<br>"
                 f"<span style='color:#555;'>Director: {_s(tg[2])} | Prog: {_s(tg[6])} | "
                 f"Año: {_s(tg[7])}</span></p>"
                 for tg in detalle["trabajos_grado_estudiante"]
@@ -2138,7 +2629,7 @@ class VistaGrupos(QWidget):
         if self._cache_gruplac is None:
             self._cache_gruplac = self._analisis_gruplac._cargar_integrantes_gruplac()
         return self._cache_gruplac
-    
+
     def setup_ui(self):
         layout = QVBoxLayout()
         layout.setSpacing(2)
@@ -2193,7 +2684,34 @@ class VistaGrupos(QWidget):
         self.check_proy.setChecked(True)
         self.check_proy.stateChanged.connect(self.seleccionar_grupo)
         layout_barra.addWidget(self.check_proy)
-        
+
+        self.check_pi = QCheckBox("PI")
+        self.check_pi.setChecked(True)
+        self.check_pi.setToolTip("Propiedad Intelectual")
+        self.check_pi.stateChanged.connect(self.seleccionar_grupo)
+        layout_barra.addWidget(self.check_pi)
+
+        layout_barra.addWidget(QLabel("|"))
+
+        # Período (año desde - hasta) que se muestra y se exporta
+        layout_barra.addWidget(QLabel("Año:"))
+        self.spin_anio_desde = QSpinBox()
+        self.spin_anio_desde.setRange(1990, 2035)
+        self.spin_anio_desde.setValue(2022)
+        self.spin_anio_desde.setFixedWidth(60)
+        self.spin_anio_desde.setToolTip("Año inicial del período a mostrar/exportar")
+        self.spin_anio_desde.valueChanged.connect(self._cambio_rango_anios)
+        layout_barra.addWidget(self.spin_anio_desde)
+
+        layout_barra.addWidget(QLabel("-"))
+        self.spin_anio_hasta = QSpinBox()
+        self.spin_anio_hasta.setRange(1990, 2035)
+        self.spin_anio_hasta.setValue(datetime.now().year)
+        self.spin_anio_hasta.setFixedWidth(60)
+        self.spin_anio_hasta.setToolTip("Año final del período a mostrar/exportar")
+        self.spin_anio_hasta.valueChanged.connect(self._cambio_rango_anios)
+        layout_barra.addWidget(self.spin_anio_hasta)
+
         layout_barra.addStretch()
         
         # Botones exportar
@@ -2223,8 +2741,8 @@ class VistaGrupos(QWidget):
         layout_int.addWidget(lbl_int)
         
         self.tabla_integrantes = QTableWidget()
-        self.tabla_integrantes.setColumnCount(4)
-        self.tabla_integrantes.setHorizontalHeaderLabels(['Nombre', 'Tipo', 'Email', 'Facultad'])
+        self.tabla_integrantes.setColumnCount(5)
+        self.tabla_integrantes.setHorizontalHeaderLabels(['Nombre', 'Tipo', 'Email', 'Facultad', 'Procedencia'])
         self.tabla_integrantes.horizontalHeader().setStretchLastSection(True)
         self.tabla_integrantes.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tabla_integrantes.verticalHeader().setVisible(False)
@@ -2292,6 +2810,11 @@ class VistaGrupos(QWidget):
             if grupo[0]:
                 self.combo_grupos.addItem(grupo[0])
     
+    def _cambio_rango_anios(self):
+        if self.spin_anio_desde.value() > self.spin_anio_hasta.value():
+            self.spin_anio_hasta.setValue(self.spin_anio_desde.value())
+        self.seleccionar_grupo()
+
     def seleccionar_grupo(self, grupo=None):
         if grupo is None:
             grupo = self.combo_grupos.currentText()
@@ -2311,6 +2834,8 @@ class VistaGrupos(QWidget):
             self.tabla_integrantes.setItem(row, 1, QTableWidgetItem(persona[2] or ''))
             self.tabla_integrantes.setItem(row, 2, QTableWidgetItem(persona[3] or ''))
             self.tabla_integrantes.setItem(row, 3, QTableWidgetItem(persona[4] or ''))
+            self.tabla_integrantes.setItem(row, 4, QTableWidgetItem(
+                self.db.procedencia_grupo(persona[0], grupo)))
         
         # Generar reporte automáticamente
         filtros = []
@@ -2324,12 +2849,18 @@ class VistaGrupos(QWidget):
             filtros.append('Productos Innovación')
         if self.check_proy.isChecked():
             filtros.append('Proyectos')
-        
+        if self.check_pi.isChecked():
+            filtros.append('Propiedad Intelectual')
+
         if not filtros:
             self.tabla_productos.setRowCount(0)
             return
-        
-        productos = self.db.obtener_productos_grupo_detallado(grupo, filtros)
+
+        productos = self.db.obtener_productos_grupo_detallado(
+            grupo, filtros,
+            anio_desde=self.spin_anio_desde.value(),
+            anio_hasta=self.spin_anio_hasta.value(),
+        )
         productos = self._agrupar_por_titulo(productos)
         self.productos_completos = productos
         self.tabla_productos.setRowCount(len(productos))
@@ -2384,6 +2915,20 @@ class VistaGrupos(QWidget):
         nombre = autor.get('nombre') or ''
         nota = autor.get('nota_gruplac')
         return f"{nombre} {nota}" if nota else nombre
+
+    @staticmethod
+    def _texto_datos_adicionales(crudo):
+        """Convierte el JSON de 'datos_adicionales' (columnas del Excel que el
+        sistema no reconocía al cargar, ver views/vista_inicio.py) a un texto
+        legible de una línea, para mostrarlo en el panel de detalle y en los
+        exports."""
+        if not crudo:
+            return ''
+        try:
+            datos = json.loads(crudo)
+        except (TypeError, ValueError):
+            return ''
+        return '; '.join(f'{k}: {v}' for k, v in datos.items()) if datos else ''
 
     def _nota_gruplac_autor(self, nombre, cedula):
         """
@@ -2455,6 +3000,7 @@ class VistaGrupos(QWidget):
             'Trabajo de Grado': '#3b8c66',
             'Innovación': '#a23b72',
             'Proyecto': '#c73e1d',
+            'Propiedad Intelectual': '#6a4c93',
         }
         color = COLORES_TIPO.get(tipo, '#1a365d')
 
@@ -2551,6 +3097,34 @@ class VistaGrupos(QWidget):
                 + _fila("Valor aprobado", producto.get('valor_aprobado'))
             )
 
+        elif tipo == 'Propiedad Intelectual':
+            html += (
+                f"<tr><td colspan='2' style='padding:2px 0;word-break:break-word;'>"
+                f"<b>Nombre del producto:</b> {_s(producto.get('titulo'))}</td></tr>"
+                + _fila("Tipo de producto", producto.get('tipo_producto_detalle'))
+                + _fila("Tipo de patente", producto.get('tipo_patente'))
+                + _fila("No. de registro", producto.get('numero_registro'))
+                + _fila("Proyecto", producto.get('proyecto'))
+                + _fila("Fecha de aprobación", producto.get('fecha_aprobacion'))
+                + _fila("Entidad", producto.get('entidad'))
+                + _fila("Facultad", producto.get('facultad'))
+            )
+
+        datos_adicionales = producto.get('datos_adicionales')
+        if datos_adicionales:
+            try:
+                extra = json.loads(datos_adicionales)
+            except (TypeError, ValueError):
+                extra = None
+            if extra:
+                html += (
+                    "<tr><td colspan='2' style='padding-top:6px;'>"
+                    "<div style='background:#fff8e1;border:1px solid #f0d98c;border-radius:4px;"
+                    "padding:4px 6px;'><b style='color:#8a6d00;'>Columnas adicionales del Excel:</b><br>"
+                    + "<br>".join(f"<b>{k}:</b> {_s(v)}" for k, v in extra.items())
+                    + "</div></td></tr>"
+                )
+
         html += (
             "</table>"
             "<div style='margin-top:8px;padding-top:4px;border-top:1px solid #ddd;"
@@ -2577,8 +3151,19 @@ class VistaGrupos(QWidget):
             from openpyxl.utils import get_column_letter
             
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            nombre_archivo = f"reporte_{grupo.replace(' ', '_')}_{timestamp}.xlsx"
-            
+            nombre_sugerido = f"reporte_{limpiar_nombre_archivo(grupo)}_{timestamp}.xlsx"
+            reports_dir = obtener_directorio_base() / "reports" / "excel"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+
+            ruta_str, _ = QFileDialog.getSaveFileName(
+                self, "Guardar reporte Excel del grupo",
+                str(reports_dir / nombre_sugerido), "Excel (*.xlsx)")
+            if not ruta_str:
+                return
+            ruta = Path(ruta_str)
+            if ruta.suffix.lower() != ".xlsx":
+                ruta = ruta.with_suffix(".xlsx")
+
             # Crear workbook
             wb = openpyxl.Workbook()
             
@@ -2589,16 +3174,16 @@ class VistaGrupos(QWidget):
             # Título
             ws_int['A1'] = f"GRUPO: {grupo} - INTEGRANTES"
             ws_int['A1'].font = Font(bold=True, size=14, color="1a365d")
-            ws_int.merge_cells('A1:E1')
-            
+            ws_int.merge_cells('A1:F1')
+
             # Encabezados
-            encabezados_int = ['Nombre', 'Tipo', 'Cédula', 'Email', 'Facultad']
+            encabezados_int = ['Nombre', 'Tipo', 'Cédula', 'Email', 'Facultad', 'Procedencia']
             for col, enc in enumerate(encabezados_int, 1):
                 cell = ws_int.cell(row=2, column=col, value=enc)
                 cell.font = Font(bold=True, color="FFFFFF")
                 cell.fill = PatternFill(start_color="1a365d", end_color="1a365d", fill_type="solid")
                 cell.alignment = Alignment(horizontal="center", vertical="center")
-            
+
             # Datos integrantes
             integrantes = self.db.obtener_integrantes_grupo(grupo)
             for row, persona in enumerate(integrantes, 3):
@@ -2607,27 +3192,29 @@ class VistaGrupos(QWidget):
                 ws_int.cell(row=row, column=3, value=persona[0])
                 ws_int.cell(row=row, column=4, value=persona[3] or '')
                 ws_int.cell(row=row, column=5, value=persona[4] or '')
-            
+                ws_int.cell(row=row, column=6, value=self.db.procedencia_grupo(persona[0], grupo))
+
             # Ajustar anchos
-            for col in range(1, 6):
+            for col in range(1, 7):
                 ws_int.column_dimensions[get_column_letter(col)].width = 25
             
             # ===== HOJA 2: PUBLICACIONES =====
             publicaciones = [p for p in self.productos_completos if p.get('tipo_producto') == 'Publicación']
             if publicaciones:
                 ws_pub = wb.create_sheet("Publicaciones")
-                
+
                 ws_pub['A1'] = f"GRUPO: {grupo} - PUBLICACIONES"
                 ws_pub['A1'].font = Font(bold=True, size=14, color="1a365d")
-                ws_pub.merge_cells('A1:H1')
-                
-                headers = ['Investigador', 'Título', 'Revista/Libro', 'Año', 'Tipo', 'Categoría', 'ISSN/ISBN', 'Estado']
+                ws_pub.merge_cells('A1:I1')
+
+                headers = ['Investigador', 'Título', 'Revista/Libro', 'Año', 'Tipo', 'Categoría',
+                           'ISSN/ISBN', 'Estado', 'Datos adicionales']
                 for col, h in enumerate(headers, 1):
                     cell = ws_pub.cell(row=2, column=col, value=h)
                     cell.font = Font(bold=True, color="FFFFFF")
                     cell.fill = PatternFill(start_color="3498db", end_color="3498db", fill_type="solid")
                     cell.alignment = Alignment(horizontal="center")
-                
+
                 for row, pub in enumerate(publicaciones, 3):
                     ws_pub.cell(row=row, column=1, value=pub.get('investigador', ''))
                     ws_pub.cell(row=row, column=2, value=pub.get('titulo', ''))
@@ -2637,27 +3224,30 @@ class VistaGrupos(QWidget):
                     ws_pub.cell(row=row, column=6, value=pub.get('categoria', ''))
                     ws_pub.cell(row=row, column=7, value=pub.get('issn_isbn', ''))
                     ws_pub.cell(row=row, column=8, value=pub.get('estado', ''))
-                
-                for col in range(1, 9):
+                    ws_pub.cell(row=row, column=9, value=self._texto_datos_adicionales(pub.get('datos_adicionales')))
+
+                for col in range(1, 10):
                     ws_pub.column_dimensions[get_column_letter(col)].width = 20
                 ws_pub.column_dimensions['B'].width = 50
+                ws_pub.column_dimensions['I'].width = 40
             
             # ===== HOJA 3: EXTENSIONES =====
             extensiones = [p for p in self.productos_completos if p.get('tipo_producto') == 'Extensión']
             if extensiones:
                 ws_ext = wb.create_sheet("Extensiones")
-                
+
                 ws_ext['A1'] = f"GRUPO: {grupo} - EXTENSIONES"
                 ws_ext['A1'].font = Font(bold=True, size=14, color="1a365d")
-                ws_ext.merge_cells('A1:G1')
-                
-                headers = ['Investigador', 'Actividad', 'Tipo', 'Modalidad', 'Año', 'Población', 'Estado']
+                ws_ext.merge_cells('A1:H1')
+
+                headers = ['Investigador', 'Actividad', 'Tipo', 'Modalidad', 'Año', 'Población',
+                           'Estado', 'Datos adicionales']
                 for col, h in enumerate(headers, 1):
                     cell = ws_ext.cell(row=2, column=col, value=h)
                     cell.font = Font(bold=True, color="FFFFFF")
                     cell.fill = PatternFill(start_color="e74c3c", end_color="e74c3c", fill_type="solid")
                     cell.alignment = Alignment(horizontal="center")
-                
+
                 for row, ext in enumerate(extensiones, 3):
                     ws_ext.cell(row=row, column=1, value=ext.get('investigador', ''))
                     ws_ext.cell(row=row, column=2, value=ext.get('titulo', ''))
@@ -2666,10 +3256,12 @@ class VistaGrupos(QWidget):
                     ws_ext.cell(row=row, column=5, value=ext.get('año', ''))
                     ws_ext.cell(row=row, column=6, value=ext.get('poblacion', ''))
                     ws_ext.cell(row=row, column=7, value=ext.get('estado', ''))
-                
-                for col in range(1, 8):
+                    ws_ext.cell(row=row, column=8, value=self._texto_datos_adicionales(ext.get('datos_adicionales')))
+
+                for col in range(1, 9):
                     ws_ext.column_dimensions[get_column_letter(col)].width = 20
                 ws_ext.column_dimensions['B'].width = 50
+                ws_ext.column_dimensions['H'].width = 40
             
             # ===== HOJA 4: TRABAJOS DE GRADO =====
             trabajos = [p for p in self.productos_completos if p.get('tipo_producto') == 'Trabajo de Grado']
@@ -2678,15 +3270,16 @@ class VistaGrupos(QWidget):
                 
                 ws_tg['A1'] = f"GRUPO: {grupo} - TRABAJOS DE GRADO"
                 ws_tg['A1'].font = Font(bold=True, size=14, color="1a365d")
-                ws_tg.merge_cells('A1:G1')
-                
-                headers = ['Director', 'Título', 'Estudiante', 'Programa', 'Año', 'Estado', 'Calificación']
+                ws_tg.merge_cells('A1:H1')
+
+                headers = ['Director', 'Título', 'Estudiante', 'Programa', 'Año', 'Estado',
+                           'Calificación', 'Datos adicionales']
                 for col, h in enumerate(headers, 1):
                     cell = ws_tg.cell(row=2, column=col, value=h)
                     cell.font = Font(bold=True, color="FFFFFF")
                     cell.fill = PatternFill(start_color="9b59b6", end_color="9b59b6", fill_type="solid")
                     cell.alignment = Alignment(horizontal="center")
-                
+
                 for row, tg in enumerate(trabajos, 3):
                     ws_tg.cell(row=row, column=1, value=tg.get('investigador', ''))
                     ws_tg.cell(row=row, column=2, value=tg.get('titulo', ''))
@@ -2695,11 +3288,13 @@ class VistaGrupos(QWidget):
                     ws_tg.cell(row=row, column=5, value=tg.get('año', ''))
                     ws_tg.cell(row=row, column=6, value=tg.get('estado', ''))
                     ws_tg.cell(row=row, column=7, value=tg.get('calificacion', ''))
-                
-                for col in range(1, 8):
+                    ws_tg.cell(row=row, column=8, value=self._texto_datos_adicionales(tg.get('datos_adicionales')))
+
+                for col in range(1, 9):
                     ws_tg.column_dimensions[get_column_letter(col)].width = 20
                 ws_tg.column_dimensions['B'].width = 50
-            
+                ws_tg.column_dimensions['H'].width = 40
+
             # ===== HOJA 5: PROYECTOS =====
             proyectos = [p for p in self.productos_completos if p.get('tipo_producto') == 'Proyecto']
             if proyectos:
@@ -2715,7 +3310,7 @@ class VistaGrupos(QWidget):
                     cell.font = Font(bold=True, color="FFFFFF")
                     cell.fill = PatternFill(start_color="1abc9c", end_color="1abc9c", fill_type="solid")
                     cell.alignment = Alignment(horizontal="center")
-                
+
                 for row, proy in enumerate(proyectos, 3):
                     ws_proy.cell(row=row, column=1, value=proy.get('investigador', ''))
                     ws_proy.cell(row=row, column=2, value=proy.get('titulo', ''))
@@ -2724,7 +3319,7 @@ class VistaGrupos(QWidget):
                     ws_proy.cell(row=row, column=5, value=proy.get('año', ''))
                     ws_proy.cell(row=row, column=6, value=proy.get('estado', ''))
                     ws_proy.cell(row=row, column=7, value=proy.get('valor_aprobado', ''))
-                
+
                 for col in range(1, 8):
                     ws_proy.column_dimensions[get_column_letter(col)].width = 20
                 ws_proy.column_dimensions['B'].width = 50
@@ -2733,18 +3328,18 @@ class VistaGrupos(QWidget):
             innovacion = [p for p in self.productos_completos if p.get('tipo_producto') == 'Innovación']
             if innovacion:
                 ws_inn = wb.create_sheet("Innovación")
-                
+
                 ws_inn['A1'] = f"GRUPO: {grupo} - PRODUCTOS DE INNOVACIÓN"
                 ws_inn['A1'].font = Font(bold=True, size=14, color="1a365d")
-                ws_inn.merge_cells('A1:F1')
-                
-                headers = ['Investigador', 'Nombre', 'Tipo', 'Año', 'Estado', 'Descripción']
+                ws_inn.merge_cells('A1:G1')
+
+                headers = ['Investigador', 'Nombre', 'Tipo', 'Año', 'Estado', 'Descripción', 'Datos adicionales']
                 for col, h in enumerate(headers, 1):
                     cell = ws_inn.cell(row=2, column=col, value=h)
                     cell.font = Font(bold=True, color="FFFFFF")
                     cell.fill = PatternFill(start_color="f39c12", end_color="f39c12", fill_type="solid")
                     cell.alignment = Alignment(horizontal="center")
-                
+
                 for row, inn in enumerate(innovacion, 3):
                     ws_inn.cell(row=row, column=1, value=inn.get('investigador', ''))
                     ws_inn.cell(row=row, column=2, value=inn.get('titulo', ''))
@@ -2752,17 +3347,51 @@ class VistaGrupos(QWidget):
                     ws_inn.cell(row=row, column=4, value=inn.get('año', ''))
                     ws_inn.cell(row=row, column=5, value=inn.get('estado', ''))
                     ws_inn.cell(row=row, column=6, value=inn.get('descripcion', ''))
-                
-                for col in range(1, 7):
+                    ws_inn.cell(row=row, column=7, value=self._texto_datos_adicionales(inn.get('datos_adicionales')))
+
+                for col in range(1, 8):
                     ws_inn.column_dimensions[get_column_letter(col)].width = 20
                 ws_inn.column_dimensions['B'].width = 40
                 ws_inn.column_dimensions['F'].width = 60
-            
+                ws_inn.column_dimensions['G'].width = 40
+
+            # ===== HOJA 7: PROPIEDAD INTELECTUAL =====
+            propiedad = [p for p in self.productos_completos if p.get('tipo_producto') == 'Propiedad Intelectual']
+            if propiedad:
+                ws_pi = wb.create_sheet("Propiedad Intelectual")
+
+                ws_pi['A1'] = f"GRUPO: {grupo} - PROPIEDAD INTELECTUAL"
+                ws_pi['A1'].font = Font(bold=True, size=14, color="1a365d")
+                ws_pi.merge_cells('A1:H1')
+
+                headers = ['Responsable', 'Nombre del producto', 'Tipo de producto', 'Tipo de patente',
+                           'No. de registro', 'Entidad', 'Facultad', 'Datos adicionales']
+                for col, h in enumerate(headers, 1):
+                    cell = ws_pi.cell(row=2, column=col, value=h)
+                    cell.font = Font(bold=True, color="FFFFFF")
+                    cell.fill = PatternFill(start_color="6a4c93", end_color="6a4c93", fill_type="solid")
+                    cell.alignment = Alignment(horizontal="center")
+
+                for row, pi in enumerate(propiedad, 3):
+                    ws_pi.cell(row=row, column=1, value=pi.get('investigador', ''))
+                    ws_pi.cell(row=row, column=2, value=pi.get('titulo', ''))
+                    ws_pi.cell(row=row, column=3, value=pi.get('tipo_producto_detalle', ''))
+                    ws_pi.cell(row=row, column=4, value=pi.get('tipo_patente', ''))
+                    ws_pi.cell(row=row, column=5, value=pi.get('numero_registro', ''))
+                    ws_pi.cell(row=row, column=6, value=pi.get('entidad', ''))
+                    ws_pi.cell(row=row, column=7, value=pi.get('facultad', ''))
+                    ws_pi.cell(row=row, column=8, value=self._texto_datos_adicionales(pi.get('datos_adicionales')))
+
+                for col in range(1, 9):
+                    ws_pi.column_dimensions[get_column_letter(col)].width = 20
+                ws_pi.column_dimensions['B'].width = 40
+                ws_pi.column_dimensions['H'].width = 40
+
             # Guardar
-            wb.save(nombre_archivo)
-            
-            QMessageBox.information(self, "Éxito", 
-                f"Excel exportado exitosamente:\n{nombre_archivo}\n\n"
+            wb.save(str(ruta))
+
+            QMessageBox.information(self, "Éxito",
+                f"Excel exportado exitosamente:\n{ruta}\n\n"
                 f"Integrantes: {len(integrantes)}\n"
                 f"Productos totales: {len(self.productos_completos)}")
         except Exception as e:
@@ -2791,17 +3420,21 @@ class VistaGrupos(QWidget):
             
             # ============= PASO 4: CREAR TIMESTAMP =============
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
-            # ============= PASO 5: LIMPIAR NOMBRE DEL GRUPO =============
-            # Opción 1: Limpieza básica (recomendada, más simple)
-            grupo_limpio = grupo.replace(' ', '_').replace(':', '-').replace('/', '-')
-            
-            # Opción 2: Limpieza completa (si agregaste la función)
-            # grupo_limpio = limpiar_nombre_archivo(grupo)
-            
-            # ============= PASO 6: CREAR NOMBRE DE ARCHIVO =============
-            nombre_archivo = f"reporte_{grupo_limpio}_{timestamp}.pdf"
-            
+
+            # ============= PASO 5: NOMBRE SUGERIDO Y DIÁLOGO GUARDAR COMO =============
+            nombre_sugerido = f"reporte_{limpiar_nombre_archivo(grupo)}_{timestamp}.pdf"
+            reports_dir = obtener_directorio_base() / "reports" / "pdf"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+
+            ruta_str, _ = QFileDialog.getSaveFileName(
+                self, "Guardar reporte PDF del grupo",
+                str(reports_dir / nombre_sugerido), "PDF (*.pdf)")
+            if not ruta_str:
+                return
+            ruta = Path(ruta_str)
+            if ruta.suffix.lower() != ".pdf":
+                ruta = ruta.with_suffix(".pdf")
+
             # ============= PASO 7: CREAR DOCUMENTO HTML =============
             html = f"""
             <html>
@@ -2827,21 +3460,23 @@ class VistaGrupos(QWidget):
             html += f"""
                 <h2>Integrantes ({len(integrantes)})</h2>
                 <table>
-                    <tr><th>Nombre</th><th>Tipo</th><th>Cédula</th><th>Email</th></tr>
+                    <tr><th>Nombre</th><th>Tipo</th><th>Cédula</th><th>Email</th><th>Procedencia</th></tr>
             """
-            
+
             for persona in integrantes:
+                procedencia = self.db.procedencia_grupo(persona[0], grupo)
                 html += f"""
                     <tr>
                         <td>{persona[1]}</td>
                         <td>{persona[2] or ''}</td>
                         <td>{persona[0]}</td>
                         <td>{persona[3] or ''}</td>
+                        <td>{procedencia}</td>
                     </tr>
                 """
-            
+
             html += "</table>"
-            
+
             # ============= PASO 9: PRODUCTOS POR TIPO =============
             tipos_plural = {
                 'Publicación': 'Publicaciones',
@@ -2849,6 +3484,7 @@ class VistaGrupos(QWidget):
                 'Trabajo de Grado': 'Trabajos de Grado',
                 'Innovación': 'Innovación',
                 'Proyecto': 'Proyectos',
+                'Propiedad Intelectual': 'Propiedad Intelectual',
             }
             for tipo, plural in tipos_plural.items():
                 productos_tipo = [p for p in self.productos_completos if p.get('tipo_producto') == tipo]
@@ -2857,7 +3493,7 @@ class VistaGrupos(QWidget):
                     continue
 
                 html += f'<h2>{plural} ({len(productos_tipo)})</h2>'
-                
+
                 for i, prod in enumerate(productos_tipo, 1):
                     html += f'<div class="producto">'
                     html += f'<strong>#{i}</strong> - {prod.get("titulo", "Sin título")}<br>'
@@ -2868,8 +3504,11 @@ class VistaGrupos(QWidget):
                         html += f'<em>Investigador:</em> {prod.get("investigador", "N/A")}'
                     if prod.get('año'):
                         html += f' | <em>Año:</em> {prod["año"]}'
+                    extra = self._texto_datos_adicionales(prod.get('datos_adicionales'))
+                    if extra:
+                        html += f'<br><span style="color:#888;font-size:9pt;">+ {extra}</span>'
                     html += '</div>'
-            
+
             html += "</body></html>"
             
             # ============= PASO 10: CREAR PDF =============
@@ -2878,14 +3517,14 @@ class VistaGrupos(QWidget):
             
             printer = QPrinter(QPrinter.HighResolution)
             printer.setOutputFormat(QPrinter.PdfFormat)
-            printer.setOutputFileName(nombre_archivo)
+            printer.setOutputFileName(str(ruta))
             printer.setPageSize(QPrinter.A4)
             printer.setPageMargins(10, 10, 10, 10, QPrinter.Millimeter)
-            
+
             documento.print_(printer)
-            
+
             # ============= PASO 11: MENSAJE DE ÉXITO =============
-            QMessageBox.information(self, "Éxito", f"PDF exportado:\n{nombre_archivo}")
+            QMessageBox.information(self, "Éxito", f"PDF exportado:\n{ruta}")
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error al exportar PDF:\n{str(e)}")
@@ -2901,7 +3540,11 @@ class VentanaPrincipal(QMainWindow):
         self.vista_busqueda = None
         self.vista_grupos = None
         self.setup_ui()
-        self.cargar_datos_automaticamente()
+        # Diferido al primer tick del event loop: actualizar widgets antes de
+        # que app.exec_() haya arrancado se cuelga de forma reproducible bajo
+        # PyQt5 (ver cargar_datos_automaticamente), aunque la llamada sea
+        # síncrona y en el hilo principal.
+        QTimer.singleShot(0, self.cargar_datos_automaticamente)
 
     def _crear_tab(self, index):
         if index in self._loaded_tabs:
@@ -2924,6 +3567,29 @@ class VentanaPrincipal(QMainWindow):
         elif index == 1:
             self.vista_busqueda = widget
 
+    _NOMBRE_A_INDICE_PESTANA = {
+        "inicio": 0,
+        "busqueda_personas": 1,
+        "reportes_grupo": 2,
+        "seguimiento_grupos": 3,
+    }
+
+    def _cambiar_pestana_por_nombre(self, pestana, grupo=None):
+        """Callback inyectado en VistaChatbotInvestigacion para que el
+        chatbot pueda cambiar de pestaña y, si aplica, preseleccionar un
+        grupo en la pestaña destino."""
+        idx = self._NOMBRE_A_INDICE_PESTANA.get(pestana)
+        if idx is None:
+            return
+        self.tabs.setCurrentIndex(idx)
+        if not grupo:
+            return
+        widget = self.tabs.widget(idx)
+        if hasattr(widget, 'combo_grupos'):
+            widget.combo_grupos.setCurrentText(grupo)
+        elif hasattr(widget, 'combo_grupo'):
+            widget.combo_grupo.setCurrentText(grupo)
+
     def setup_ui(self):
         self.setWindowTitle("Consolidado de Información")
         self.setGeometry(100, 100, 1400, 800)
@@ -2943,12 +3609,24 @@ class VentanaPrincipal(QMainWindow):
             "Búsqueda de Personas",
             "Reportes por Grupo",
             "Seguimiento Grupos",
+            # "Asistente",  # pestaña del chatbot retirada por ahora -- ver
+            # chatbot_investigacion.py (código intacto, solo sin punto de
+            # entrada). Para reactivarla: descomentar este título y la
+            # entrada 5 de _tab_registry más abajo, y el import de
+            # VistaChatbotInvestigacion al inicio del archivo.
+            # "Estadísticas 957" -- movida fuera de la app principal a
+            # petición del usuario: se está reconstruyendo como UI separada
+            # en UI_clasificacion/, para integrar más adelante. Ver
+            # estadisticas_957.py (código intacto, sin punto de entrada acá).
         ]
         self._tab_registry = {
             0: (lambda db: VistaInicio(db), (self.db,)),
             1: (lambda db: VistaBusqueda(db), (self.db,)),
             2: (lambda db: VistaGrupos(db), (self.db,)),
             3: (lambda db: VistaSeguimientoGrupos(db), (self.db,)),
+            # 4: (lambda db, cb: VistaChatbotInvestigacion(db, cambiar_pestana_callback=cb),
+            #     (self.db, self._cambiar_pestana_por_nombre)),
+            # 4: (lambda db: VistaEstadisticas957(db), (self.db,)),
         }
 
         for i, title in enumerate(self._tab_titles):
@@ -2963,8 +3641,24 @@ class VentanaPrincipal(QMainWindow):
         layout.addWidget(self.tabs)
     
     def cargar_datos_automaticamente(self):
-        if getattr(self, "cargador", None) is not None and self.cargador.isRunning():
+        # Corre en el hilo principal (bloqueando la UI unos segundos) en vez
+        # de en un QThread: bajo PyQt5, lanzar esta carga con
+        # CargadorDatosIntegrado.start() se cuelga de forma reproducible en
+        # esta pila (visto en Python 3.11 y 3.12, con y sin cambios propios).
+        # Llamarla directamente evita ese cuelgue; el costo es una espera de
+        # ~15s con cursor de reloj de arena, aceptable para una operación que
+        # el usuario dispara explícitamente al actualizar datos.
+        #
+        # IMPORTANTE: esta llamada debe ocurrir DESPUÉS de que arrancó el
+        # event loop de Qt (app.exec_()) -- ver VentanaPrincipal.__init__,
+        # que la difiere con QTimer.singleShot(0, ...). Actualizar widgets
+        # (statusBar, QLabel.setText) antes de que el event loop haya
+        # corrido su primera iteración también se cuelga de forma
+        # reproducible, aunque la llamada sea síncrona y en el hilo
+        # principal.
+        if getattr(self, "_cargando_datos", False):
             return
+        self._cargando_datos = True
         self.statusBar().showMessage("Cargando datos...")
         if self.vista_inicio is not None:
             self.vista_inicio.marcar_procesando("Procesando…")
@@ -2973,7 +3667,13 @@ class VentanaPrincipal(QMainWindow):
         self.cargador.progreso.connect(self.actualizar_status)
         self.cargador.finalizado.connect(self.carga_finalizada)
         self.cargador.duplicados_consolidados.connect(self.mostrar_duplicados_consolidados)
-        self.cargador.start()
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self.cargador.run()
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._cargando_datos = False
 
     def actualizar_status(self, mensaje):
         self.statusBar().showMessage(mensaje)
@@ -3016,17 +3716,7 @@ class VentanaPrincipal(QMainWindow):
         dialogo.exec_()
     
     def carga_finalizada(self, stats):
-        partes = [
-            f"Personas: {stats.get('personas', 0)}",
-            f"Grupos: {stats.get('grupos', 0)}",
-            f"Publicaciones: {stats.get('publicaciones', 0)}",
-            f"Extensiones: {stats.get('extensiones', 0)}",
-            f"Trabajos: {stats.get('trabajos', 0)}",
-            f"Innovación: {stats.get('innovacion', 0)}",
-            f"Proyectos: {stats.get('proyectos', 0)}",
-            f"Propiedad: {stats.get('propiedad', 0)}",
-        ]
-        self.statusBar().showMessage("Carga completada — " + " | ".join(partes))
+        self.statusBar().showMessage("Datos actualizados correctamente.")
         if self.vista_inicio is not None:
             self.vista_inicio.procesamiento_finalizado(stats)
             self.vista_inicio.btn_procesar.setEnabled(True)

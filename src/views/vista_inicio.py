@@ -12,10 +12,10 @@ from pathlib import Path
 
 import pandas as pd
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QFont
+from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
-    QMessageBox, QPushButton, QScrollArea, QTableWidget, QTableWidgetItem,
+    QMessageBox, QPushButton, QScrollArea,
     QVBoxLayout, QWidget,
 )
 
@@ -24,11 +24,23 @@ from constants import (
     COLUMNAS_CLAVE_POR_CATEGORIA,
     COLUMNAS_CONOCIDAS_POR_CATEGORIA,
 )
-from utils import normalizar_columna, obtener_directorio_base
+from utils import norm_text, normalizar_columna, obtener_directorio_base
+
+# Mismas claves que CargadorDatosIntegrado._find_header_row_proyectos en
+# main_10.py -- "proyectos" no tiene el encabezado en la fila 0 (trae filas
+# de metadatos/condiciones antes), así que _columnas_excel no puede leerlo
+# con un pd.read_excel(nrows=0) normal: hay que escanear filas buscando la
+# combinación que identifica la fila de encabezado real.
+_PROYECTOS_CLAVE_RESP = {"responsable", "responsables", "investigador principal"}
+_PROYECTOS_CLAVE_ID = {"cedula", "documento"}
+_PROYECTOS_CLAVE_OTRO = {"codigo cie", "objetivo", "titulo"}
 
 # Hojas a inspeccionar por categoría cuando el Excel tiene varias (None = todas).
 _HOJAS_POR_CATEGORIA = {
-    "extension": ["Consolidado"],
+    # "Datos": formato "Informe Extensión" (fuente adicional distinta de la
+    # institucional "Consolidado ..."), ver
+    # CargadorDatosIntegrado._extraer_extension_informe en main_10.py.
+    "extension": ["Consolidado", "Datos"],
     "cgt0104_2025": None,  # se filtran por nombre de hoja más abajo
     "cgt0104_2024": None,
 }
@@ -43,9 +55,7 @@ class VistaInicio(QWidget):
         super().__init__()
         self.db = db
         self.base_dir = obtener_directorio_base()
-        self._labels_stats = {}
         self.setup_ui()
-        self.actualizar_estado_archivos()
 
     # ------------------------------------------------------------------
     def setup_ui(self):
@@ -128,16 +138,6 @@ class VistaInicio(QWidget):
         fila_agregar.addWidget(btn_agregar)
         layout.addLayout(fila_agregar)
 
-        self.tabla_archivos = QTableWidget()
-        self.tabla_archivos.setColumnCount(4)
-        self.tabla_archivos.setHorizontalHeaderLabels(
-            ["Dato", "Archivo", "Última actualización", "Estado"]
-        )
-        self.tabla_archivos.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.tabla_archivos.setSelectionMode(QTableWidget.NoSelection)
-        self.tabla_archivos.verticalHeader().setVisible(False)
-        layout.addWidget(self.tabla_archivos)
-
         fila_botones = QHBoxLayout()
         self.lbl_estado_carga = QLabel("")
         self.lbl_estado_carga.setStyleSheet("color: #555;")
@@ -157,85 +157,40 @@ class VistaInicio(QWidget):
     def _panel_estadisticas(self):
         box = QGroupBox("Datos cargados actualmente")
         layout = QGridLayout(box)
+        layout.setSpacing(10)
         etiquetas = [
-            ("personas", "Personas"), ("grupos", "Grupos"),
-            ("publicaciones", "Publicaciones"), ("extensiones", "Extensiones"),
-            ("trabajos", "Trabajos de grado"), ("innovacion", "Innovación"),
-            ("proyectos", "Proyectos"), ("propiedad", "Propiedad intelectual"),
+            "Personas", "Grupos", "Publicaciones", "Extensiones",
+            "Trabajos de grado", "Innovación", "Proyectos", "Propiedad intelectual",
         ]
-        for i, (clave, texto) in enumerate(etiquetas):
-            valor = QLabel("0")
-            valor.setFont(QFont("Arial", 18, QFont.Bold))
-            valor.setStyleSheet("color: #1a365d;")
-            valor.setAlignment(Qt.AlignCenter)
-            nombre = QLabel(texto)
-            nombre.setAlignment(Qt.AlignCenter)
-            celda = QVBoxLayout()
-            celda.addWidget(valor)
-            celda.addWidget(nombre)
-            cont = QWidget()
-            cont.setLayout(celda)
-            layout.addWidget(cont, i // 4, i % 4)
-            self._labels_stats[clave] = valor
+        for i, texto in enumerate(etiquetas):
+            chip = QLabel(f"✓  {texto}")
+            chip.setFont(QFont("Arial", 10, QFont.Bold))
+            chip.setAlignment(Qt.AlignCenter)
+            chip.setStyleSheet(
+                "background-color: #eaf1f8; color: #1a365d;"
+                "border: 1px solid #c7d9ea; border-radius: 8px;"
+                "padding: 12px 6px;"
+            )
+            layout.addWidget(chip, i // 4, i % 4)
         return box
 
     # ------------------------------------------------------------------
-    def _sello_carga(self):
-        try:
-            row = self.db.conn.execute(
-                "SELECT valor FROM configuracion WHERE clave='sello_carga'"
-            ).fetchone()
-            return json.loads(row[0]) if row else {}
-        except Exception:
-            return {}
-
-    def actualizar_estado_archivos(self):
-        sello = self._sello_carga()
-        self.tabla_archivos.setRowCount(len(ARCHIVOS_FUENTE_957))
-
-        for fila, cat in enumerate(ARCHIVOS_FUENTE_957):
-            ruta_encontrada = None
-            for nombre in cat["variantes"]:
-                ruta = self.base_dir / nombre
-                if ruta.exists():
-                    ruta_encontrada = ruta
-                    break
-
-            self.tabla_archivos.setItem(fila, 0, QTableWidgetItem(cat["label"]))
-
-            if ruta_encontrada is None:
-                self.tabla_archivos.setItem(fila, 1, QTableWidgetItem("—"))
-                self.tabla_archivos.setItem(fila, 2, QTableWidgetItem("—"))
-                estado_item = QTableWidgetItem("✗ No cargado")
-                estado_item.setForeground(QColor("#a02020"))
-            else:
-                mtime = ruta_encontrada.stat().st_mtime
-                self.tabla_archivos.setItem(fila, 1, QTableWidgetItem(ruta_encontrada.name))
-                self.tabla_archivos.setItem(
-                    fila, 2,
-                    QTableWidgetItem(datetime.fromtimestamp(mtime).strftime("%d/%m/%Y %H:%M")),
-                )
-                if ruta_encontrada.name == cat["variantes"][0]:
-                    mtime_previo = sello.get(str(ruta_encontrada))
-                    if mtime_previo is None or mtime > mtime_previo:
-                        estado_item = QTableWidgetItem("⏳ Pendiente de procesar")
-                        estado_item.setForeground(QColor("#b9770e"))
-                    else:
-                        estado_item = QTableWidgetItem("✓ Procesado")
-                        estado_item.setForeground(QColor("#1e7e34"))
-                else:
-                    estado_item = QTableWidgetItem("✓ Cargado")
-                    estado_item.setForeground(QColor("#1e7e34"))
-            self.tabla_archivos.setItem(fila, 3, estado_item)
-
-        self.tabla_archivos.resizeColumnsToContents()
-        self.tabla_archivos.horizontalHeader().setStretchLastSection(True)
+    def _archivo_principal(self, categoria):
+        """Ruta del archivo canónico ya cargado para esta categoría (la
+        primera variante de nombre que exista en disco), o None si aún no
+        se ha cargado ninguno."""
+        for nombre in categoria["variantes"]:
+            ruta = self.base_dir / nombre
+            if ruta.exists():
+                return ruta
+        return None
 
     def _agregar_archivo(self):
         """Punto único de carga: el usuario elige cualquier Excel y el sistema
         detecta a qué categoría de ARCHIVOS_FUENTE_957 corresponde por sus
-        columnas. Los archivos ya guardados no se tocan; esto solo añade o
-        reemplaza el de la categoría detectada."""
+        columnas. Los archivos ya guardados no se tocan: si ya hay uno
+        cargado para esa categoría, el nuevo se guarda como fuente adicional
+        (no lo reemplaza) y ambos se procesan juntos."""
         ruta_origen, _ = QFileDialog.getOpenFileName(
             self, "Seleccionar archivo a cargar", str(self.base_dir),
             "Archivos Excel (*.xlsx *.xls)",
@@ -250,33 +205,64 @@ class VistaInicio(QWidget):
         if not self._confirmar_columnas_nuevas(ruta_origen, categoria):
             return
 
-        destino = self.base_dir / categoria["variantes"][0]
+        nombre_original = Path(ruta_origen).name
+        es_adicional = self._archivo_principal(categoria) is not None
+        if not es_adicional:
+            destino = self.base_dir / categoria["variantes"][0]
+        else:
+            carpeta_extra = self.base_dir / "data" / "input" / "adicionales" / categoria["clave"]
+            carpeta_extra.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            destino = carpeta_extra / f"{timestamp}__{nombre_original}"
+
         try:
             shutil.copyfile(ruta_origen, destino)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"No se pudo copiar el archivo:\n{e}")
             return
 
-        QMessageBox.information(
-            self, "Archivo cargado",
-            f'"{Path(ruta_origen).name}" se guardó como dato de entrada para '
-            f'"{categoria["label"]}".\n\nPulse "Procesar datos nuevos" para incorporarlo.',
-        )
-        self.actualizar_estado_archivos()
+        if es_adicional:
+            self.db.registrar_fuente_adicional(categoria["clave"], str(destino), nombre_original)
+            mensaje = (
+                f'"{nombre_original}" se guardó como fuente ADICIONAL para '
+                f'"{categoria["label"]}" (ya había un archivo cargado; este no lo '
+                'reemplaza, se suman los datos de ambos).\n\n'
+                'Pulse "Procesar datos nuevos" para incorporarlo.'
+            )
+        else:
+            mensaje = (
+                f'"{nombre_original}" se guardó como dato de entrada para '
+                f'"{categoria["label"]}".\n\nPulse "Procesar datos nuevos" para incorporarlo.'
+            )
+        QMessageBox.information(self, "Archivo cargado", mensaje)
 
     def _resolver_categoria(self, ruta_origen):
         """Determina a qué categoría de ARCHIVOS_FUENTE_957 corresponde el
         archivo elegido, comparando sus columnas contra las columnas clave
-        (distintivas) de cada categoría. Si no reconoce ninguna o coincide con
-        varias, deja que el usuario la elija de una lista en vez de adivinar."""
-        candidatas = []
+        (distintivas) de cada categoría. Si una sola categoría tiene
+        claramente MÁS columnas coincidentes que el resto, se elige esa sola
+        automáticamente (sin preguntar) -- antes se exigía que coincidiera
+        con exactamente una categoría cualquiera fuera el número de
+        coincidencias, así que un archivo que calzaba en 3 columnas de
+        "extension" pero también rozaba 1 columna genérica de "integrantes"
+        (ej. "número documento", presente en casi cualquier reporte con
+        personas) disparaba el popup de "tipo ambiguo" sin necesidad --
+        confirmado real con el archivo "Informe Extensión". Solo se pregunta
+        si de verdad hay un empate en el máximo, o si nada coincide."""
+        puntajes = []
         for cat in ARCHIVOS_FUENTE_957:
             columnas_clave = COLUMNAS_CLAVE_POR_CATEGORIA.get(cat["clave"])
             if not columnas_clave:
                 continue
             detectadas = self._columnas_excel(ruta_origen, cat["clave"])
-            if detectadas & columnas_clave:
-                candidatas.append(cat)
+            coincidencias = len(detectadas & columnas_clave)
+            if coincidencias:
+                puntajes.append((cat, coincidencias))
+
+        candidatas = []
+        if puntajes:
+            mejor = max(p for _, p in puntajes)
+            candidatas = [cat for cat, p in puntajes if p == mejor]
 
         if len(candidatas) == 1:
             return candidatas[0]
@@ -314,6 +300,9 @@ class VistaInicio(QWidget):
         except Exception:
             return set()
 
+        if clave == "proyectos":
+            return self._fila_encabezado_proyectos(xls, xls.sheet_names[0])
+
         if clave in ("cgt0104_2025", "cgt0104_2024"):
             hojas = [s for s in xls.sheet_names if "Soporte" in s or "Reg Propiedad" in s]
         elif hojas == [None]:
@@ -329,6 +318,28 @@ class VistaInicio(QWidget):
                 continue
             columnas.update(normalizar_columna(c) for c in encabezados)
         return columnas
+
+    @staticmethod
+    def _fila_encabezado_proyectos(xls, hoja, max_scan=50):
+        """Escanea las primeras filas (encabezado corrido, con metadatos
+        antes) buscando la fila que identifica un reporte de 'Proyectos de
+        investigación' -- misma condición que
+        CargadorDatosIntegrado._find_header_row_proyectos, para que la
+        detección de categoría en Inicio calce con lo que el extractor real
+        termina usando."""
+        try:
+            df = pd.read_excel(xls, sheet_name=hoja, header=None,
+                                nrows=max_scan, dtype=str).fillna("")
+        except Exception:
+            return set()
+        for _, fila in df.iterrows():
+            vals = [norm_text(str(v)) for v in fila.tolist()]
+            have_resp = any(any(k in v for k in _PROYECTOS_CLAVE_RESP) for v in vals)
+            have_id = any(any(k in v for k in _PROYECTOS_CLAVE_ID) for v in vals)
+            have_otro = any(any(k in v for k in _PROYECTOS_CLAVE_OTRO) for v in vals)
+            if have_resp and (have_id or have_otro):
+                return {normalizar_columna(v) for v in vals if v}
+        return set()
 
     def _columnas_aceptadas(self, clave) -> set:
         try:
@@ -424,14 +435,8 @@ class VistaInicio(QWidget):
         return True
 
     # ------------------------------------------------------------------
-    def actualizar_estadisticas(self, stats: dict):
-        for clave, label in self._labels_stats.items():
-            label.setText(str(stats.get(clave, 0)))
-
     def marcar_procesando(self, mensaje: str):
         self.lbl_estado_carga.setText(mensaje)
 
     def procesamiento_finalizado(self, stats: dict):
-        self.actualizar_estadisticas(stats)
-        self.actualizar_estado_archivos()
         self.lbl_estado_carga.setText("Datos al día.")

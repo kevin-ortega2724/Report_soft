@@ -177,6 +177,37 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_proyectos_grupo ON proyectos(grupo)")
         self.conn.commit()
 
+    # ── Fuentes adicionales (archivos que se acumulan sin reemplazar) ──
+
+    def obtener_fuentes_adicionales(self, clave: str) -> list:
+        """Archivos adicionales registrados para una categoría de
+        ARCHIVOS_FUENTE_957 (más allá del archivo canónico), cada uno con
+        su propia ruta única -- se procesan todos, ninguno reemplaza a otro."""
+        row = self.conn.execute(
+            "SELECT valor FROM configuracion WHERE clave = ?",
+            (f"fuentes_adicionales_{clave}",),
+        ).fetchone()
+        if not row:
+            return []
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return []
+
+    def registrar_fuente_adicional(self, clave: str, ruta: str, nombre_original: str):
+        from datetime import datetime
+        fuentes = self.obtener_fuentes_adicionales(clave)
+        fuentes.append({
+            "ruta": ruta,
+            "nombre_original": nombre_original,
+            "fecha_agregado": datetime.now().isoformat(timespec="seconds"),
+        })
+        self.conn.execute(
+            "INSERT OR REPLACE INTO configuracion (clave, valor) VALUES (?, ?)",
+            (f"fuentes_adicionales_{clave}", json.dumps(fuentes)),
+        )
+        self.conn.commit()
+
     # ── Cache de carga ──
 
     def guardar_sello_carga(self, archivos: list):

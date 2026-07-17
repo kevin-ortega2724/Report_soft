@@ -664,6 +664,21 @@ COLUMNAS_CONOCIDAS_POR_CATEGORIA = {
         "nombre", "tipo_de_patente", "no_de_registro", "proyecto_de_investigacion",
         "fecha_de_aprobacion", "entidad_que_lo_expide", "facultad",
     },
+    # A diferencia del reporte institucional de trabajos de grado (que no
+    # trae encabezado y se lee por posición), un reporte de prácticas sí
+    # trae encabezado de columna -- por eso "trabajos_grado" SÍ tiene un set
+    # de columnas conocidas aquí, a pesar de que la nota en la sección
+    # siguiente diga que normalmente queda fuera por ser posicional. Ver
+    # CargadorDatosIntegrado._extraer_practicas en main_10.py. Nota:
+    # "escenario_de_practica", "nit", "ciudad" y "modalidad_de_practica" se
+    # dejan FUERA a propósito -- no tienen un campo propio en la tabla
+    # trabajos_grado, así que caen a "datos_adicionales" en vez de perderse.
+    "trabajos_grado": {
+        "no", "codigo_estudiante", "codigo_estudia", "nombre_del_estudiante",
+        "facultad", "programa_academico", "nombre_de_la_practica",
+        "tipo_de_practica", "fecha_de_inicio", "fecha_de_finalizacion",
+        "cedula_docente_guia", "nombre_docente_guia",
+    },
 }
 # La categoría "produccion_2025_ciarp" comparte el mismo extractor/columnas que
 # "produccion_2024", y "cgt0104_2024" comparte las de "cgt0104_2025".
@@ -685,6 +700,18 @@ COLUMNAS_CLAVE_POR_CATEGORIA = {
     "extension": {
         "nombre_actividad", "fecha_inicial", "modalidad",
         "grupo_semillero_de_investigacion", "poblacion_beneficiaria",
+        # Formato alterno "Informe Extensión" (hoja 'Datos', ver
+        # CargadorDatosIntegrado._extraer_extension_informe en main_10.py).
+        "grupo_s__de_investigacion", "nombre_responsable",
+    },
+    # "proyectos": el encabezado real no está en la fila 0 (hay filas de
+    # metadatos/condiciones antes) -- _columnas_excel en vista_inicio.py lo
+    # detecta con el mismo escaneo de filas que usa el extractor real
+    # (CargadorDatosIntegrado._find_header_row_proyectos), así que este set
+    # sí se compara contra columnas reales pese al encabezado corrido.
+    "proyectos": {
+        "codigo_cie", "objetivo_proyecto", "objetivo", "valor_finan_utp",
+        "grupo_adscrito", "responsables", "responsable", "nombre_proyecto",
     },
     "produccion_2024": {
         "nombre_del_trabajo", "revista_o_libro", "revista_libro",
@@ -694,6 +721,10 @@ COLUMNAS_CLAVE_POR_CATEGORIA = {
     "cgt0104_2025": {
         "tipo_de_producto", "no_de_registro", "proyecto_de_investigacion",
         "fecha_de_aprobacion", "entidad_que_lo_expide",
+    },
+    "trabajos_grado": {
+        "escenario_de_practica", "nombre_de_la_practica", "modalidad_de_practica",
+        "tipo_de_practica", "cedula_docente_guia", "nombre_docente_guia",
     },
 }
 COLUMNAS_CLAVE_POR_CATEGORIA["produccion_2025_ciarp"] = COLUMNAS_CLAVE_POR_CATEGORIA["produccion_2024"]

@@ -6,7 +6,6 @@ import json
 import os
 import re
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -53,6 +52,49 @@ class CargadorDatosIntegrado(QThread):
         return ['publicaciones', 'extensiones', 'trabajos_grado',
                 'productos_innovacion', 'proyectos', 'propiedad_intelectual']
 
+    @staticmethod
+    def _serie_o_vacia(df, columna):
+        """Como df.get(columna, ''), pero el valor por defecto es una
+        Serie vacía alineada al índice de df. pd.Series(dtype=str) suelto
+        tiene su propio índice vacío (longitud 0); si una columna del Excel
+        no existe y se usa ese valor por defecto dentro de un zip() junto a
+        columnas que sí tienen datos, zip() corta TODO el resultado a
+        longitud 0 en silencio -- así se perdían filas completas (ej.
+        publicaciones enteras) cuando el Excel de origen no traía alguna
+        columna esperada ('tipo', 'grupo', 'estado', etc.)."""
+        if columna in df.columns:
+            return df[columna]
+        return pd.Series([''] * len(df), index=df.index)
+
+    # Las categorías de ARCHIVOS_FUENTE_957 (constants.py) no siempre son 1:1
+    # con los extractores de aquí -- p.ej. "produccion_2024" y
+    # "produccion_2025_ciarp" son dos categorías (para que Inicio las liste
+    # y valide por separado) pero un único extractor (_extraer_produccion)
+    # las procesa juntas. Este mapeo agrupa las claves de categoría que le
+    # corresponden a cada extractor, para poder sumarles sus fuentes
+    # adicionales (archivos que el usuario acumuló sin reemplazar).
+    _CLAVES_POR_EXTRACTOR = {
+        'integrantes': ['integrantes'],
+        'extension': ['extension'],
+        'produccion': ['produccion_2024', 'produccion_2025_ciarp'],
+        'trabajos_grado': ['trabajos_grado'],
+        'libros': ['libros'],
+        'innovacion': ['innovacion'],
+        'proyectos': ['proyectos'],
+        'propiedad_intelectual': ['cgt0104_2025', 'cgt0104_2024'],
+    }
+
+    def _rutas_adicionales(self, extractor):
+        """Archivos que el usuario acumuló (sin reemplazar) para las
+        categorías de este extractor, vía 'Agregar archivo' en Inicio."""
+        rutas = []
+        for clave in self._CLAVES_POR_EXTRACTOR.get(extractor, []):
+            for fuente in self.db.obtener_fuentes_adicionales(clave):
+                p = Path(fuente.get("ruta", ""))
+                if p.exists():
+                    rutas.append(p)
+        return rutas
+
     def _delete_datos_para_archivo(self, ruta):
         nombre = os.path.basename(ruta)
         conn = self.db.conn
@@ -60,6 +102,14 @@ class CargadorDatosIntegrado(QThread):
             conn.execute(f"DELETE FROM {tabla} WHERE fuente LIKE ?", (f'%{nombre}%',))
 
     def run(self):
+        # QThread.run() definido directamente con la carga pesada adentro se
+        # cuelga de forma reproducible al llamar self.progreso.emit() desde
+        # ahí (visto en Python 3.11 y 3.12, con y sin ThreadPoolExecutor,
+        # incluso con el código original sin tocar). Delegar a un método
+        # aparte evita el cuelgue -- ver _procesar_carga().
+        self._procesar_carga()
+
+    def _procesar_carga(self):
         base = self.archivos_directorio
         nomina_nombres = [
             "Listado Integrantes Grupos de Investigación UTP  080825.xlsx",
@@ -86,6 +136,9 @@ class CargadorDatosIntegrado(QThread):
                 alt = base / n
                 if alt.exists():
                     archivos_fuente[i] = str(alt)
+
+        for extractor in self._CLAVES_POR_EXTRACTOR:
+            archivos_fuente.extend(str(p) for p in self._rutas_adicionales(extractor))
 
         if self.db.cache_valida(archivos_fuente):
             self.progreso.emit("Base de datos en caché — omitiendo reproceso")
@@ -114,17 +167,20 @@ class CargadorDatosIntegrado(QThread):
                 'libros':               self._extraer_libros,
                 'productos_innovacion': self._extraer_productos_innovacion,
             }
+            # Secuencial, no concurrente: bajo PyQt5, ejecutar estos extractores
+            # en un ThreadPoolExecutor desde dentro de un QThread.run() se
+            # cuelga de forma reproducible (visto en Python 3.11 y 3.12, con y
+            # sin cambios propios) sin lanzar excepción. El tiempo total no
+            # cambia -- lo domina trabajos_grado (~13s), que ya era el cuello
+            # de botella con o sin concurrencia.
             resultados = {}
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                futuros = {pool.submit(fn): name for name, fn in extractores.items()}
-                for futuro in as_completed(futuros):
-                    name = futuros[futuro]
-                    try:
-                        resultados[name] = futuro.result()
-                        self.progreso.emit(f"✓ Extraídos datos de {name}")
-                    except Exception as e:
-                        self.progreso.emit(f"Error extrayendo {name}: {e}")
-                        resultados[name] = ([], [])
+            for name, fn in extractores.items():
+                try:
+                    resultados[name] = fn()
+                    self.progreso.emit(f"✓ Extraídos datos de {name}")
+                except Exception as e:
+                    self.progreso.emit(f"Error extrayendo {name}: {e}")
+                    resultados[name] = ([], [])
 
             self.progreso.emit("Insertando datos en la base…")
             for name, (pers, _) in resultados.items():
@@ -267,30 +323,38 @@ class CargadorDatosIntegrado(QThread):
             'Listado Integrantes Grupos de Investigacion UTP - 080825.xlsx',
             'integrantes.xlsx',
         ]
+        rutas = []
         for archivo in archivos:
             ruta = self.archivos_directorio / "data" / "input" / archivo
             if not ruta.exists():
                 ruta = self.archivos_directorio / archivo
-            if not ruta.exists():
-                continue
+            if ruta.exists():
+                rutas.append(ruta)
+                break
+        rutas.extend(self._rutas_adicionales('integrantes'))
+
+        personas_b, grupos_b = [], []
+        for ruta in rutas:
             df = self._normalizar_cols(
                 pd.read_excel(ruta, engine='openpyxl', dtype=str).fillna('')
             )
-            cedulas    = df.get('numero_documento', df.get('cedula', pd.Series(dtype=str))).apply(limpiar_cedula)
-            nombres    = df.get('nombres', df.get('nombre', pd.Series(dtype=str))).apply(limpiar_texto)
-            grupos_s   = df.get('nombre_grupo', df.get('grupo', pd.Series(dtype=str))).apply(limpiar_texto)
-            facultades = df.get('facultad', pd.Series(dtype=str)).apply(limpiar_texto)
-            emails     = df.get('email', pd.Series(dtype=str)).apply(limpiar_texto)
-            tipos      = df.get('tipo', pd.Series(dtype=str)).apply(limpiar_texto)
+            cedulas    = (df['numero_documento'] if 'numero_documento' in df.columns
+                          else self._serie_o_vacia(df, 'cedula')).apply(limpiar_cedula)
+            nombres    = (df['nombres'] if 'nombres' in df.columns
+                          else self._serie_o_vacia(df, 'nombre')).apply(limpiar_texto)
+            grupos_s   = (df['nombre_grupo'] if 'nombre_grupo' in df.columns
+                          else self._serie_o_vacia(df, 'grupo')).apply(limpiar_texto)
+            facultades = self._serie_o_vacia(df, 'facultad').apply(limpiar_texto)
+            emails     = self._serie_o_vacia(df, 'email').apply(limpiar_texto)
+            tipos      = self._serie_o_vacia(df, 'tipo').apply(limpiar_texto)
             mask = (cedulas.str.len() > 0) & (nombres.str.len() > 0)
-            personas_b = list(zip(cedulas[mask], nombres[mask], emails[mask], facultades[mask], tipos[mask]))
-            grupos_b   = [
+            personas_b.extend(zip(cedulas[mask], nombres[mask], emails[mask], facultades[mask], tipos[mask]))
+            grupos_b.extend(
                 (c, g, f, t)
                 for c, g, f, t in zip(cedulas[mask], grupos_s[mask], facultades[mask], tipos[mask])
                 if g
-            ]
-            return personas_b, grupos_b
-        return [], []
+            )
+        return personas_b, grupos_b
 
     # ── Extensiones ──
 
@@ -300,45 +364,49 @@ class CargadorDatosIntegrado(QThread):
             'Actividades Extensión enerojulio.xlsx',
             'Actividades Extensión (enero-julio).xlsx',
         ]
-        personas_b, ext_b = [], []
+        rutas = []
         for archivo in archivos:
             ruta = self.archivos_directorio / "data" / "input" / archivo
             if not ruta.exists():
                 ruta = self.archivos_directorio / archivo
-            if not ruta.exists():
-                continue
+            if ruta.exists():
+                rutas.append(ruta)
+        rutas.extend(self._rutas_adicionales('extension'))
+
+        personas_b, ext_b = [], []
+        for ruta in rutas:
             df = self._normalizar_cols(
                 pd.read_excel(ruta, sheet_name='Consolidado', engine='openpyxl', dtype=str).fillna('')
             )
-            cedulas = df.get('cedula', pd.Series(dtype=str)).apply(limpiar_cedula)
+            cedulas = self._serie_o_vacia(df, 'cedula').apply(limpiar_cedula)
             mask = cedulas.str.len() > 0
             if not mask.any():
                 continue
             dv = df[mask]
             cv = cedulas[mask]
-            nombres   = dv.get('nombre_responsable', pd.Series(dtype=str)).apply(limpiar_texto).replace('', 'Sin nombre')
-            facultades = (dv.get('facultad_dependencia') if 'facultad_dependencia' in dv.columns
-                          else dv.get('facultad', pd.Series(dtype=str))).apply(limpiar_texto)
-            fis       = dv.get('fecha_inicial', pd.Series(dtype=str)).astype(str)
+            nombres   = self._serie_o_vacia(dv, 'nombre_responsable').apply(limpiar_texto).replace('', 'Sin nombre')
+            facultades = (dv['facultad_dependencia'] if 'facultad_dependencia' in dv.columns
+                          else self._serie_o_vacia(dv, 'facultad')).apply(limpiar_texto)
+            fis       = self._serie_o_vacia(dv, 'fecha_inicial').astype(str)
             anios     = fis.str[:4].apply(self._anio)
-            grupos_s  = (dv.get('grupo_semillero_de_investigacion') if 'grupo_semillero_de_investigacion' in dv.columns
-                         else dv.get('grupo', pd.Series(dtype=str))).apply(limpiar_texto)
+            grupos_s  = (dv['grupo_semillero_de_investigacion'] if 'grupo_semillero_de_investigacion' in dv.columns
+                         else self._serie_o_vacia(dv, 'grupo')).apply(limpiar_texto)
             personas_b.extend(zip(cv, nombres, pd.Series('', index=dv.index), facultades, pd.Series('Responsable', index=dv.index)))
             ext_b.extend(zip(
                 cv,
-                dv.get('nombre_actividad', pd.Series(dtype=str)).apply(limpiar_texto),
-                dv.get('tipo', pd.Series(dtype=str)).apply(limpiar_texto),
-                dv.get('modalidad', pd.Series(dtype=str)).apply(limpiar_texto),
-                dv.get('estado', pd.Series(dtype=str)).apply(limpiar_texto),
+                self._serie_o_vacia(dv, 'nombre_actividad').apply(limpiar_texto),
+                self._serie_o_vacia(dv, 'tipo').apply(limpiar_texto),
+                self._serie_o_vacia(dv, 'modalidad').apply(limpiar_texto),
+                self._serie_o_vacia(dv, 'estado').apply(limpiar_texto),
                 fis,
-                dv.get('fecha_final', pd.Series(dtype=str)).apply(limpiar_texto),
+                self._serie_o_vacia(dv, 'fecha_final').apply(limpiar_texto),
                 anios,
-                dv.get('poblacion_beneficiaria', pd.Series(dtype=str)).apply(limpiar_texto),
+                self._serie_o_vacia(dv, 'poblacion_beneficiaria').apply(limpiar_texto),
                 grupos_s,
                 facultades,
-                dv.get('financiacion_interna', pd.Series(dtype=str)).apply(limpiar_texto),
-                dv.get('fuente_financiacion_externa', pd.Series(dtype=str)).apply(limpiar_texto),
-                [archivo] * len(dv),
+                self._serie_o_vacia(dv, 'financiacion_interna').apply(limpiar_texto),
+                self._serie_o_vacia(dv, 'fuente_financiacion_externa').apply(limpiar_texto),
+                [ruta.name] * len(dv),
             ))
         return personas_b, ext_b
 
@@ -350,47 +418,51 @@ class CargadorDatosIntegrado(QThread):
             'BASE DATOS PRODUCCIÓN  2025  CIARP.xlsx',
             'BASE DATOS PRODUCCIÓN  2025 - CIARP.xlsx',
         ]
-        personas_b, pub_b = [], []
+        rutas = []
         for archivo in archivos:
             ruta = self.archivos_directorio / "data" / "input" / archivo
             if not ruta.exists():
                 ruta = self.archivos_directorio / archivo
-            if not ruta.exists():
-                continue
+            if ruta.exists():
+                rutas.append(ruta)
+        rutas.extend(self._rutas_adicionales('produccion'))
+
+        personas_b, pub_b = [], []
+        for ruta in rutas:
             xls = pd.ExcelFile(ruta, engine='openpyxl')
             for sheet in xls.sheet_names:
                 df = self._normalizar_cols(
                     pd.read_excel(xls, sheet_name=sheet, dtype=str).fillna('')
                 )
-                cedulas = df.get('cedula', pd.Series(dtype=str)).apply(limpiar_cedula)
+                cedulas = self._serie_o_vacia(df, 'cedula').apply(limpiar_cedula)
                 mask = cedulas.str.len() > 0
                 if not mask.any():
                     continue
                 dv = df[mask]
                 cv = cedulas[mask]
-                nombres   = (dv.get('autores') if 'autores' in dv.columns
-                             else dv.get('autor') if 'autor' in dv.columns
-                             else dv.get('nombre', pd.Series(dtype=str))).apply(limpiar_texto)
-                facultades = (dv.get('dependencia') if 'dependencia' in dv.columns
-                              else dv.get('facultad', pd.Series(dtype=str))).apply(limpiar_texto)
-                fuente = f'{archivo} :: {sheet}'
+                nombres   = (dv['autores'] if 'autores' in dv.columns
+                             else dv['autor'] if 'autor' in dv.columns
+                             else self._serie_o_vacia(dv, 'nombre')).apply(limpiar_texto)
+                facultades = (dv['dependencia'] if 'dependencia' in dv.columns
+                              else self._serie_o_vacia(dv, 'facultad')).apply(limpiar_texto)
+                fuente = f'{ruta.name} :: {sheet}'
                 personas_b.extend(zip(cv, nombres, pd.Series('', index=dv.index), facultades, pd.Series('Autor', index=dv.index)))
                 pub_b.extend(zip(
                     cv,
-                    (dv.get('nombre_del_trabajo') if 'nombre_del_trabajo' in dv.columns
-                     else dv.get('titulo', pd.Series(dtype=str))).apply(limpiar_texto),
-                    (dv.get('revista_o_libro') if 'revista_o_libro' in dv.columns
-                     else dv.get('revista_libro', pd.Series(dtype=str))).apply(limpiar_texto),
-                    (dv.get('doi_url') if 'doi_url' in dv.columns
-                     else dv.get('doi', pd.Series(dtype=str))).apply(limpiar_texto),
-                    (dv.get('issn_isbn') if 'issn_isbn' in dv.columns
-                     else dv.get('issn', pd.Series(dtype=str))).apply(limpiar_texto),
-                    (dv.get('ano_de_la_publicacion') if 'ano_de_la_publicacion' in dv.columns
-                     else dv.get('ano', pd.Series(dtype=str))).apply(self._anio),
-                    dv.get('tipo', pd.Series(dtype=str)).apply(limpiar_texto),
-                    dv.get('categoria', pd.Series(dtype=str)).apply(limpiar_texto),
-                    dv.get('estado', pd.Series(dtype=str)).apply(limpiar_texto),
-                    dv.get('grupo', pd.Series(dtype=str)).apply(limpiar_texto),
+                    (dv['nombre_del_trabajo'] if 'nombre_del_trabajo' in dv.columns
+                     else self._serie_o_vacia(dv, 'titulo')).apply(limpiar_texto),
+                    (dv['revista_o_libro'] if 'revista_o_libro' in dv.columns
+                     else self._serie_o_vacia(dv, 'revista_libro')).apply(limpiar_texto),
+                    (dv['doi_url'] if 'doi_url' in dv.columns
+                     else self._serie_o_vacia(dv, 'doi')).apply(limpiar_texto),
+                    (dv['issn_isbn'] if 'issn_isbn' in dv.columns
+                     else self._serie_o_vacia(dv, 'issn')).apply(limpiar_texto),
+                    (dv['ano_de_la_publicacion'] if 'ano_de_la_publicacion' in dv.columns
+                     else self._serie_o_vacia(dv, 'ano')).apply(self._anio),
+                    self._serie_o_vacia(dv, 'tipo').apply(limpiar_texto),
+                    self._serie_o_vacia(dv, 'categoria').apply(limpiar_texto),
+                    self._serie_o_vacia(dv, 'estado').apply(limpiar_texto),
+                    self._serie_o_vacia(dv, 'grupo').apply(limpiar_texto),
                     [fuente] * len(dv),
                 ))
         return personas_b, pub_b
@@ -403,13 +475,17 @@ class CargadorDatosIntegrado(QThread):
             'TrabajosGrado_TrabajoDeGrado 2024.xlsx',
             'Trabajos Grado - Trabajo de Grado.xlsx',
         ]
-        personas_b, tg_b = [], []
+        rutas = []
         for archivo in archivos:
             ruta = self.archivos_directorio / "data" / "input" / archivo
             if not ruta.exists():
                 ruta = self.archivos_directorio / archivo
-            if not ruta.exists():
-                continue
+            if ruta.exists():
+                rutas.append(ruta)
+        rutas.extend(self._rutas_adicionales('trabajos_grado'))
+
+        personas_b, tg_b = [], []
+        for ruta in rutas:
             df = pd.read_excel(ruta, engine='openpyxl', header=None)
             director_actual = cedula_director = None
             for row in df.itertuples(index=False):
@@ -442,7 +518,7 @@ class CargadorDatosIntegrado(QThread):
                         limpiar_texto(str(row[3]) if len(row) > 3 and pd.notna(row[3]) else ''),
                         anio,
                         limpiar_texto(str(row[4]) if len(row) > 4 and pd.notna(row[4]) else ''),
-                        fecha, archivo,
+                        fecha, ruta.name,
                     ))
         return personas_b, tg_b
 
@@ -453,13 +529,17 @@ class CargadorDatosIntegrado(QThread):
             'Reporte de libros y capítulos publicados.xlsx',
             'Reporte_libros.xlsx',
         ]
-        personas_b, pub_b = [], []
+        rutas = []
         for archivo in archivos:
             ruta = self.archivos_directorio / "data" / "input" / archivo
             if not ruta.exists():
                 ruta = self.archivos_directorio / archivo
-            if not ruta.exists():
-                continue
+            if ruta.exists():
+                rutas.append(ruta)
+        rutas.extend(self._rutas_adicionales('libros'))
+
+        personas_b, pub_b = [], []
+        for ruta in rutas:
             df = pd.read_excel(ruta, engine='openpyxl', header=None)
             titulo_actual = tipo_actual = None
             autores_libro = []
@@ -468,7 +548,7 @@ class CargadorDatosIntegrado(QThread):
                 for aut in autores_libro:
                     pub_b.append((
                         aut['cedula'], titulo_actual, '', '', '', None,
-                        'LIBRO', tipo_actual or 'LIBRO', '', '', archivo,
+                        'LIBRO', tipo_actual or 'LIBRO', '', '', ruta.name,
                     ))
 
             for row in df.itertuples(index=False):
@@ -493,33 +573,38 @@ class CargadorDatosIntegrado(QThread):
         ruta = self.archivos_directorio / "data" / "input" / 'info_productos_innovacion.xlsx'
         if not ruta.exists():
             ruta = self.archivos_directorio / 'info_productos_innovacion.xlsx'
-        if not ruta.exists():
+        rutas = [ruta] if ruta.exists() else []
+        rutas.extend(self._rutas_adicionales('innovacion'))
+        if not rutas:
             return [], []
-        df = self._normalizar_cols(
-            pd.read_excel(ruta, engine='openpyxl', dtype=str).fillna('')
-        )
-        nombres = (df.get('nombre') if 'nombre' in df.columns
-                   else df.get('titulo') if 'titulo' in df.columns
-                   else df.get('producto', pd.Series(dtype=str))).apply(limpiar_texto)
-        mask = nombres.str.len() > 0
-        if not mask.any():
-            return [], []
-        dv = df[mask]
-        nv = nombres[mask]
-        anios = (dv.get('ano_de_registro') if 'ano_de_registro' in dv.columns
-                 else dv.get('ano', pd.Series(dtype=str))).apply(self._anio)
-        batch = list(zip(
-            ['0000000'] * len(dv),
-            (dv.get('tipo_de_producto') if 'tipo_de_producto' in dv.columns
-             else dv.get('tipo', pd.Series(dtype=str))).apply(limpiar_texto),
-            nv,
-            dv.get('descripcion', pd.Series(dtype=str)).apply(limpiar_texto),
-            anios,
-            dv.get('estado', pd.Series(dtype=str)).apply(limpiar_texto),
-            (dv.get('grupo_de_investigacion') if 'grupo_de_investigacion' in dv.columns
-             else dv.get('grupo', pd.Series(dtype=str))).apply(limpiar_texto),
-            ['info_productos_innovacion.xlsx'] * len(dv),
-        ))
+
+        batch = []
+        for ruta in rutas:
+            df = self._normalizar_cols(
+                pd.read_excel(ruta, engine='openpyxl', dtype=str).fillna('')
+            )
+            nombres = (df['nombre'] if 'nombre' in df.columns
+                       else df['titulo'] if 'titulo' in df.columns
+                       else self._serie_o_vacia(df, 'producto')).apply(limpiar_texto)
+            mask = nombres.str.len() > 0
+            if not mask.any():
+                continue
+            dv = df[mask]
+            nv = nombres[mask]
+            anios = (dv['ano_de_registro'] if 'ano_de_registro' in dv.columns
+                     else self._serie_o_vacia(dv, 'ano')).apply(self._anio)
+            batch.extend(zip(
+                ['0000000'] * len(dv),
+                (dv['tipo_de_producto'] if 'tipo_de_producto' in dv.columns
+                 else self._serie_o_vacia(dv, 'tipo')).apply(limpiar_texto),
+                nv,
+                self._serie_o_vacia(dv, 'descripcion').apply(limpiar_texto),
+                anios,
+                self._serie_o_vacia(dv, 'estado').apply(limpiar_texto),
+                (dv['grupo_de_investigacion'] if 'grupo_de_investigacion' in dv.columns
+                 else self._serie_o_vacia(dv, 'grupo')).apply(limpiar_texto),
+                [ruta.name] * len(dv),
+            ))
         return [], batch
 
     # ── Proyectos ──
@@ -532,104 +617,104 @@ class CargadorDatosIntegrado(QThread):
             "proyectos_investigacion_2024.xlsx",
             "proyectos 2024.xlsx"
         ]
-        archivo_encontrado = None
+        rutas = []
         for archivo in archivos_posibles:
             ruta = self.archivos_directorio / "data" / "input" / archivo
             if not ruta.exists():
                 ruta = self.archivos_directorio / archivo
             if ruta.exists():
-                archivo_encontrado = archivo
+                rutas.append(ruta)
                 break
-        if not archivo_encontrado:
+        rutas.extend(self._rutas_adicionales('proyectos'))
+        if not rutas:
             self.progreso.emit("⚠ No se encontró archivo de proyectos de investigación")
             return
-        ruta = self.archivos_directorio / "data" / "input" / archivo_encontrado
-        if not ruta.exists():
-            ruta = self.archivos_directorio / archivo_encontrado
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", UserWarning)
-                df_raw = pd.read_excel(ruta, sheet_name=0, header=None, dtype=str, engine="openpyxl")
-            df_raw = df_raw.fillna("")
-            hdr_row = self._find_header_row_proyectos(df_raw)
-            if hdr_row is None:
-                self.progreso.emit(f"⚠ No se detectó encabezado en {archivo_encontrado}. Intentando lectura estándar...")
-                df = pd.read_excel(ruta, engine='openpyxl')
-            else:
-                self.progreso.emit(f"✓ Encabezado detectado en fila {hdr_row+1}")
-                colmap = self._pick_columns_proyectos(df_raw.iloc[hdr_row, :])
-                self.progreso.emit(f"Columnas detectadas: {sum(1 for v in colmap.values() if v is not None)}/{len(colmap)}")
-                df = pd.DataFrame()
-                for col_name, col_idx in colmap.items():
-                    if col_idx is not None:
-                        df[col_name] = df_raw.iloc[hdr_row+1:, col_idx].astype(str).str.strip()
-            count = 0
-            for _, row in df.iterrows():
-                if 'RESPONSABLE' in df.columns:
-                    responsable = limpiar_texto(row.get('RESPONSABLE', ''))
-                    cedula = limpiar_cedula(row.get('CEDULA', ''))
-                    titulo = limpiar_texto(row.get('TITULO', ''))
-                    objetivo = limpiar_texto(row.get('OBJETIVO', ''))
-                    codigo_cie = limpiar_texto(row.get('CODIGO_CIE', ''))
-                    tipo = limpiar_texto(row.get('TIPO_INV', ''))
-                    año = row.get('ANIO', '')
-                    fecha_inicio = limpiar_texto(row.get('FECHA_INICIO', ''))
-                    fecha_fin = limpiar_texto(row.get('FECHA_FINAL', ''))
-                    estado = limpiar_texto(row.get('ESTADO', ''))
-                    facultad = limpiar_texto(row.get('FACULTAD', ''))
-                    grupo = limpiar_texto(row.get('GRUPO', ''))
-                    valor = limpiar_texto(row.get('VALOR_APROBADO', ''))
+
+        for ruta in rutas:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    df_raw = pd.read_excel(ruta, sheet_name=0, header=None, dtype=str, engine="openpyxl")
+                df_raw = df_raw.fillna("")
+                hdr_row = self._find_header_row_proyectos(df_raw)
+                if hdr_row is None:
+                    self.progreso.emit(f"⚠ No se detectó encabezado en {ruta.name}. Intentando lectura estándar...")
+                    df = pd.read_excel(ruta, engine='openpyxl')
                 else:
-                    cedula = limpiar_cedula(
-                        row.get('Cedula') or row.get('Cédula') or row.get('CEDULA') or
-                        row.get('Documento') or row.get('Número de documento') or ''
-                    )
-                    responsable = limpiar_texto(
-                        row.get('Responsable') or row.get('RESPONSABLE') or
-                        row.get('Investigador principal') or row.get('Nombre') or ''
-                    )
-                    titulo = limpiar_texto(
-                        row.get('Título') or row.get('Titulo') or row.get('TITULO') or
-                        row.get('Nombre proyecto') or ''
-                    )
-                    objetivo = limpiar_texto(row.get('Objetivo') or row.get('OBJETIVO') or '')
-                    codigo_cie = limpiar_texto(row.get('Código CIE') or row.get('Codigo CIE') or '')
-                    tipo = limpiar_texto(row.get('Tipo') or row.get('TIPO') or '')
-                    año = row.get('Año') or row.get('AÑO') or row.get('Ano')
-                    fecha_inicio = limpiar_texto(row.get('Fecha inicio') or row.get('FECHA INICIO') or '')
-                    fecha_fin = limpiar_texto(row.get('Fecha final') or row.get('FECHA FINAL') or '')
-                    estado = limpiar_texto(row.get('Estado') or row.get('ESTADO') or '')
-                    facultad = limpiar_texto(row.get('Facultad') or row.get('FACULTAD') or '')
-                    grupo = limpiar_texto(row.get('Grupo') or row.get('GRUPO') or '')
-                    valor = limpiar_texto(row.get('Valor aprobado') or row.get('VALOR APROBADO') or '')
-                if not titulo:
-                    continue
-                if not cedula:
-                    cedula = '0000000'
-                if responsable:
-                    self.db.insertar_persona(cedula, responsable, '', facultad, 'Investigador')
-                if pd.notna(año) and año:
-                    try:
-                        año = int(str(año).split('.')[0])
-                    except:
-                        año = None
-                cedula_principal = self.db.obtener_cedula_principal(cedula)
-                cursor = self.db.conn.cursor()
-                cursor.execute('''
-                    INSERT INTO proyectos
-                    (cedula, responsable, titulo, objetivo, codigo_cie, tipo, año,
-                     fecha_inicio, fecha_fin, estado, facultad, grupo, valor_aprobado, fuente)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    cedula_principal, responsable, titulo, objetivo, codigo_cie,
-                    tipo, año, fecha_inicio, fecha_fin, estado, facultad,
-                    grupo, valor, archivo_encontrado
-                ))
-                count += 1
-            self.db.conn.commit()
-            self.progreso.emit(f"✓ Cargados {count} proyectos de investigación desde {archivo_encontrado}")
-        except Exception as e:
-            self.progreso.emit(f"Error en proyectos: {str(e)}")
+                    self.progreso.emit(f"✓ Encabezado detectado en fila {hdr_row+1} ({ruta.name})")
+                    colmap = self._pick_columns_proyectos(df_raw.iloc[hdr_row, :])
+                    self.progreso.emit(f"Columnas detectadas: {sum(1 for v in colmap.values() if v is not None)}/{len(colmap)}")
+                    df = pd.DataFrame()
+                    for col_name, col_idx in colmap.items():
+                        if col_idx is not None:
+                            df[col_name] = df_raw.iloc[hdr_row+1:, col_idx].astype(str).str.strip()
+                count = 0
+                for _, row in df.iterrows():
+                    if 'RESPONSABLE' in df.columns:
+                        responsable = limpiar_texto(row.get('RESPONSABLE', ''))
+                        cedula = limpiar_cedula(row.get('CEDULA', ''))
+                        titulo = limpiar_texto(row.get('TITULO', ''))
+                        objetivo = limpiar_texto(row.get('OBJETIVO', ''))
+                        codigo_cie = limpiar_texto(row.get('CODIGO_CIE', ''))
+                        tipo = limpiar_texto(row.get('TIPO_INV', ''))
+                        año = row.get('ANIO', '')
+                        fecha_inicio = limpiar_texto(row.get('FECHA_INICIO', ''))
+                        fecha_fin = limpiar_texto(row.get('FECHA_FINAL', ''))
+                        estado = limpiar_texto(row.get('ESTADO', ''))
+                        facultad = limpiar_texto(row.get('FACULTAD', ''))
+                        grupo = limpiar_texto(row.get('GRUPO', ''))
+                        valor = limpiar_texto(row.get('VALOR_APROBADO', ''))
+                    else:
+                        cedula = limpiar_cedula(
+                            row.get('Cedula') or row.get('Cédula') or row.get('CEDULA') or
+                            row.get('Documento') or row.get('Número de documento') or ''
+                        )
+                        responsable = limpiar_texto(
+                            row.get('Responsable') or row.get('RESPONSABLE') or
+                            row.get('Investigador principal') or row.get('Nombre') or ''
+                        )
+                        titulo = limpiar_texto(
+                            row.get('Título') or row.get('Titulo') or row.get('TITULO') or
+                            row.get('Nombre proyecto') or ''
+                        )
+                        objetivo = limpiar_texto(row.get('Objetivo') or row.get('OBJETIVO') or '')
+                        codigo_cie = limpiar_texto(row.get('Código CIE') or row.get('Codigo CIE') or '')
+                        tipo = limpiar_texto(row.get('Tipo') or row.get('TIPO') or '')
+                        año = row.get('Año') or row.get('AÑO') or row.get('Ano')
+                        fecha_inicio = limpiar_texto(row.get('Fecha inicio') or row.get('FECHA INICIO') or '')
+                        fecha_fin = limpiar_texto(row.get('Fecha final') or row.get('FECHA FINAL') or '')
+                        estado = limpiar_texto(row.get('Estado') or row.get('ESTADO') or '')
+                        facultad = limpiar_texto(row.get('Facultad') or row.get('FACULTAD') or '')
+                        grupo = limpiar_texto(row.get('Grupo') or row.get('GRUPO') or '')
+                        valor = limpiar_texto(row.get('Valor aprobado') or row.get('VALOR APROBADO') or '')
+                    if not titulo:
+                        continue
+                    if not cedula:
+                        cedula = '0000000'
+                    if responsable:
+                        self.db.insertar_persona(cedula, responsable, '', facultad, 'Investigador')
+                    if pd.notna(año) and año:
+                        try:
+                            año = int(str(año).split('.')[0])
+                        except:
+                            año = None
+                    cedula_principal = self.db.obtener_cedula_principal(cedula)
+                    cursor = self.db.conn.cursor()
+                    cursor.execute('''
+                        INSERT INTO proyectos
+                        (cedula, responsable, titulo, objetivo, codigo_cie, tipo, año,
+                         fecha_inicio, fecha_fin, estado, facultad, grupo, valor_aprobado, fuente)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        cedula_principal, responsable, titulo, objetivo, codigo_cie,
+                        tipo, año, fecha_inicio, fecha_fin, estado, facultad,
+                        grupo, valor, ruta.name
+                    ))
+                    count += 1
+                self.db.conn.commit()
+                self.progreso.emit(f"✓ Cargados {count} proyectos de investigación desde {ruta.name}")
+            except Exception as e:
+                self.progreso.emit(f"Error en proyectos ({ruta.name}): {str(e)}")
 
     def _find_header_row_proyectos(self, df, max_scan=50):
         keys_any = {"responsable", "responsables", "investigador principal"}
@@ -690,13 +775,17 @@ class CargadorDatosIntegrado(QThread):
             "CGT0104  No de productos resultados de investigacion 31072025.xlsx",
             "CGT0104  No de productos resultados de investigacion 31122024.xlsx"
         ]
-        count = 0
+        rutas = []
         for archivo in archivos_posibles:
             ruta = self.archivos_directorio / "data" / "input" / archivo
             if not ruta.exists():
                 ruta = self.archivos_directorio / archivo
-            if not ruta.exists():
-                continue
+            if ruta.exists():
+                rutas.append(ruta)
+        rutas.extend(self._rutas_adicionales('propiedad_intelectual'))
+
+        count = 0
+        for ruta in rutas:
             try:
                 wb = pd.ExcelFile(ruta, engine='openpyxl')
                 for sheet_name in wb.sheet_names:
@@ -724,11 +813,11 @@ class CargadorDatosIntegrado(QThread):
                                 limpiar_texto(row.get('Fecha de aprobación') or ''),
                                 limpiar_texto(row.get('Entidad que lo expide') or ''),
                                 limpiar_texto(row.get('Facultad') or ''),
-                                f"{archivo} :: {sheet_name}"
+                                f"{ruta.name} :: {sheet_name}"
                             ))
                             count += 1
                 self.db.conn.commit()
             except Exception as e:
-                self.progreso.emit(f"Error en {archivo}: {str(e)}")
+                self.progreso.emit(f"Error en {ruta.name}: {str(e)}")
         if count > 0:
             self.progreso.emit(f"Cargados {count} registros de propiedad intelectual")

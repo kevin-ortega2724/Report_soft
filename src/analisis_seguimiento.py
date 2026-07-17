@@ -1194,6 +1194,7 @@ class SimuladorCategoriaInterna:
             FROM trabajos_grado
             WHERE cedula_director IN ({placeholders})
               AND año IS NOT NULL
+              AND (calificacion IS NULL OR calificacion != 'NO CONDUCENTE')
             """,
             cedulas,
         ).fetchall()
@@ -1450,6 +1451,7 @@ class SimuladorCategoriaInterna:
             FROM trabajos_grado
             WHERE cedula_director IN ({placeholders})
               AND año IS NOT NULL
+              AND (calificacion IS NULL OR calificacion != 'NO CONDUCENTE')
             """,
             cedulas,
         ).fetchall()

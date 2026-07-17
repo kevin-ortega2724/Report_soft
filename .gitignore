@@ -23,3 +23,9 @@ Modelo_medicion/
 # ya depurado.
 claude_1.md
 cambios_quitados.txt
+
+# Salida de PyInstaller (build_exe.bat / consolidados.spec) -- binarios
+# regenerables, cientos de MB, no van en el repo.
+build/
+dist/
+*.exe

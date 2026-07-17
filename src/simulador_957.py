@@ -60,6 +60,7 @@ import openpyxl
 import pandas as pd
 
 from utils import normalizar_nombre
+from views.vista_seguimiento_grupos import _carpeta_gruplac_mas_reciente
 
 # BD del scraping GrupLAC/ScienTI (NO el archivo de incentivos CIARP, que
 # es otra fuente distinta — ver discusión sobre quién trae el cuartil).
@@ -298,18 +299,18 @@ class Simulador957:
         self, ruta_reports: str | pathlib.Path | None = None
     ) -> dict[str, int]:
         """
-        Lee el año de formación de cada grupo desde reports/excel/<grupo>/.
-        Empareja el nombre de carpeta con `nombre_grupo` de medicion_957.xlsx
-        por coincidencia exacta normalizada, contención, o solapamiento de
-        palabras (Jaccard >= 0.5) para tolerar siglas y nombres truncados.
+        Lee el año de formación de cada grupo desde la carpeta
+        'data/reporte excel_<fecha>' MÁS RECIENTE (scrape actual de
+        GrupLAC). Empareja el nombre de carpeta con `nombre_grupo` de
+        medicion_957.xlsx por coincidencia exacta normalizada, contención,
+        o solapamiento de palabras (Jaccard >= 0.5) para tolerar siglas y
+        nombres truncados.
         """
         if ruta_reports is None:
-            ruta_reports = (
-                pathlib.Path(__file__).parent.parent / "reports" / "excel"
-            )
-        ruta_reports = pathlib.Path(ruta_reports)
-        if not ruta_reports.exists():
+            ruta_reports = _carpeta_gruplac_mas_reciente()
+        if ruta_reports is None or not pathlib.Path(ruta_reports).exists():
             return {}
+        ruta_reports = pathlib.Path(ruta_reports)
 
         anio_por_carpeta: dict[str, int] = {}
         for carpeta in ruta_reports.iterdir():

@@ -34,6 +34,7 @@ from utils import (
     clasificar_producto_957,
     get_orden_categoria,
     get_orden_producto,
+    limpiar_nombre_archivo,
     normalizar_nombre_hoja,
     obtener_directorio_base,
     tokenizar_autores,
@@ -3034,7 +3035,13 @@ class VistaSeguimientoGrupos(QWidget):
     def __init__(self, db):
         super().__init__()
         self.db = db
-        self.reporte_excel_path = "reports/excel"
+        # "reports/excel" es un scrape viejo (dic-2025) que quedó de una
+        # corrida anterior -- el botón "Ver Excel" y la comparación de esta
+        # pestaña deben abrir/usar siempre el scrape MÁS RECIENTE de
+        # data/reporte excel_<fecha> (mismo que usa Cumplimiento), no ese
+        # directorio fijo desactualizado.
+        carpeta_reciente = _carpeta_gruplac_mas_reciente()
+        self.reporte_excel_path = str(carpeta_reciente) if carpeta_reciente else "reports/excel"
         self.datos_comparacion = None
         self.thread_procesamiento = None
         self.setup_ui()
@@ -3068,7 +3075,7 @@ class VistaSeguimientoGrupos(QWidget):
         header_layout.addWidget(QLabel("hasta:"))
         self.spin_anio_hasta = QSpinBox()
         self.spin_anio_hasta.setRange(1990, 2035)
-        self.spin_anio_hasta.setValue(2025)
+        self.spin_anio_hasta.setValue(date.today().year)
         self.spin_anio_hasta.setFixedWidth(70)
         self.spin_anio_hasta.setToolTip("Año final del rango")
         header_layout.addWidget(self.spin_anio_hasta)
@@ -3097,17 +3104,13 @@ class VistaSeguimientoGrupos(QWidget):
             "QPushButton:disabled{background-color:#bdc3c7;}")
         header_layout.addWidget(self.btn_duplicados)
 
-        self.btn_panorama = QPushButton("📊 Panorama General")
-        self.btn_panorama.setToolTip(
-            "Agrega el % de cumplimiento de todos los grupos y el total de "
-            "faltantes por categoría en un solo tablero -- mismos datos que "
-            "el panel Cumplimiento, solo que juntos.")
-        self.btn_panorama.clicked.connect(self.mostrar_panorama_general)
-        self.btn_panorama.setStyleSheet(
-            "QPushButton{background-color:#1baf7a;color:white;padding:8px 20px;"
-            "border-radius:4px;font-weight:bold;font-size:12px;}"
-            "QPushButton:hover{background-color:#158f63;}")
-        header_layout.addWidget(self.btn_panorama)
+        # Botón "Panorama General" retirado de la UI a propósito: el resumen
+        # narrativo actual (ResumenIAThread) es un solo prompt de una vía
+        # contra Ollama local, no un chat interactivo que pueda navegar
+        # pestañas o responder preguntas de seguimiento -- se va a rehacer
+        # como módulo aparte (chatbot con tool-calling) antes de volver a
+        # exponerlo. DialogoPanoramaGeneral y mostrar_panorama_general
+        # quedan intactos en el código, solo sin punto de entrada.
 
         self.btn_scraping_gruplac = QPushButton("Actualizar GrupLAC (Web)")
         self.btn_scraping_gruplac.clicked.connect(self.iniciar_scraping_gruplac)
@@ -3174,9 +3177,8 @@ class VistaSeguimientoGrupos(QWidget):
         layout_izq.addWidget(lbl_tabla)
 
         self.tabla_comparacion = QTableWidget()
-        self.tabla_comparacion.setColumnCount(3)
-        self.tabla_comparacion.setHorizontalHeaderLabels([
-            'Grupo', 'Internos (BD)', 'GrupLAC'])
+        self.tabla_comparacion.setColumnCount(1)
+        self.tabla_comparacion.setHorizontalHeaderLabels(['Grupo'])
         self.tabla_comparacion.horizontalHeader().setStretchLastSection(False)
         self.tabla_comparacion.setEditTriggers(QTableWidget.NoEditTriggers)
         self.tabla_comparacion.setSelectionBehavior(QTableWidget.SelectRows)
@@ -3402,27 +3404,6 @@ class VistaSeguimientoGrupos(QWidget):
         total_con_gruplac = 0
 
         for row, grupo in enumerate(grupos):
-            cursor = self.db.conn.cursor()
-            total_int = 0
-            for tabla, campo in [('publicaciones', 'cedula'), ('extensiones', 'cedula'),
-                                  ('trabajos_grado', 'cedula_director'), ('proyectos', 'cedula')]:
-                try:
-                    cnt = cursor.execute(
-                        f'SELECT COUNT(*) FROM {tabla} WHERE {campo} IN '
-                        f'(SELECT cedula FROM grupos WHERE grupo = ?)', (grupo,)
-                    ).fetchone()[0]
-                    total_int += cnt
-                except Exception:
-                    pass
-            try:
-                cnt = cursor.execute(
-                    'SELECT COUNT(*) FROM productos_innovacion WHERE cedula IN '
-                    '(SELECT cedula FROM grupos WHERE grupo = ?)', (grupo,)
-                ).fetchone()[0]
-                total_int += cnt
-            except Exception:
-                pass
-
             glac = datos_gruplac.get(grupo, {}).get('total', 0)
 
             if glac > 0:
@@ -3430,21 +3411,7 @@ class VistaSeguimientoGrupos(QWidget):
 
             self.tabla_comparacion.setItem(row, 0, QTableWidgetItem(grupo))
 
-            item_bd = QTableWidgetItem(str(total_int))
-            item_bd.setTextAlignment(Qt.AlignCenter)
-            if total_int > 0:
-                item_bd.setBackground(QColor(230, 255, 230))
-            self.tabla_comparacion.setItem(row, 1, item_bd)
-
-            item_g = QTableWidgetItem(str(glac))
-            item_g.setTextAlignment(Qt.AlignCenter)
-            item_g.setBackground(QColor(230, 255, 230) if glac > 0 else QColor(255, 230, 230))
-            self.tabla_comparacion.setItem(row, 2, item_g)
-
         self.tabla_comparacion.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        for col in range(1, 3):
-            self.tabla_comparacion.horizontalHeader().setSectionResizeMode(
-                col, QHeaderView.ResizeToContents)
 
         self.lbl_total_grupos.setText(f"Total grupos: {len(grupos)}")
         self.lbl_con_gruplac.setText(f"Con GrupLAC: {total_con_gruplac}")
@@ -3734,9 +3701,17 @@ class VistaSeguimientoGrupos(QWidget):
 
         grupo = self.combo_grupo.currentText()
         timestamp = date.today().strftime("%Y%m%d")
-        sufijo = f"_{grupo[:20]}" if grupo else ""
-        nombre = f"REPORTE_FALTANTES_{timestamp}{sufijo}.xlsx"
-        ruta = reports_dir / nombre
+        sufijo = f"_{limpiar_nombre_archivo(grupo)[:20]}" if grupo else ""
+        nombre_sugerido = f"REPORTE_FALTANTES_{timestamp}{sufijo}.xlsx"
+
+        ruta_str, _ = QFileDialog.getSaveFileName(
+            self, "Guardar reporte de faltantes",
+            str(reports_dir / nombre_sugerido), "Excel (*.xlsx)")
+        if not ruta_str:
+            return
+        ruta = Path(ruta_str)
+        if ruta.suffix.lower() != ".xlsx":
+            ruta = ruta.with_suffix(".xlsx")
 
         try:
             ComparadorFaltantes.generar_reporte_excel(df, ruta)

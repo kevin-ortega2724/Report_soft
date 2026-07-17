@@ -387,6 +387,11 @@ class ComparadorFaltantes:
             "detalle_verificacion": detalle,
             "necesita_revision": "Segundo barrido" in estado,
             "es_faltante": estado == "Faltante real",
+            # Solo presente para categoria == "trabajos_grado" (ver
+            # comparador_gruplac_scrapeado._extraer_estudiante); vacío para
+            # el resto de categorías/comparadores.
+            "estudiante_gruplac": rec.get("estudiante_norm", "") if rec else "",
+            "estudiante_gruplac_valor": rec.get("estudiante_value", "") if rec else "",
         }
 
     # ── Comparar todos los grupos ─────────────────────────────────────
@@ -473,15 +478,15 @@ class ComparadorFaltantes:
         ws_det = wb.active
         ws_det.title = "Faltantes Detalle"
         ws_det.sheet_view.showGridLines = False
-        anchos = [55, 28, 20, 20, 14, 12]
-        cols_det = ["Producto", "Grupo", "Categoría", "Hoja", "Estado", "Similitud"]
+        anchos = [55, 30, 28, 20, 20, 14, 12]
+        cols_det = ["Producto", "Responsable", "Grupo", "Categoría", "Hoja", "Estado", "Similitud"]
         for i, (col, ancho) in enumerate(zip(cols_det, anchos), 1):
             ws_det.column_dimensions[get_column_letter(i)].width = ancho
             c = ws_det.cell(row=1, column=i, value=col)
             estilo_encabezado(c)
         ws_det.row_dimensions[1].height = 24
 
-        ws_det.merge_cells("A2:F2")
+        ws_det.merge_cells("A2:G2")
         c = ws_det["A2"]
         c.value = "⚠  Estos productos deben ser registrados en GrupLAC"
         c.fill = PatternFill("solid", fgColor="FFF2CC")
@@ -498,6 +503,7 @@ class ComparadorFaltantes:
             bg = "FFE5E5" if row.get("es_faltante", False) else "FFF2CC"
             vals = [
                 str(row.get("producto", "")),
+                str(row.get("responsable", "")),
                 str(row.get("grupo_original", "")),
                 str(row.get("categoria", "")),
                 str(row.get("hoja", "")),
@@ -509,7 +515,7 @@ class ComparadorFaltantes:
                 c.fill = PatternFill("solid", fgColor=bg)
                 c.font = Font(name="Calibri", size=9)
                 c.alignment = Alignment(vertical="center", wrap_text=True,
-                                        horizontal="left" if col in (1, 2, 3, 4, 5) else "center")
+                                        horizontal="left" if col in (1, 2, 3, 4, 5, 6) else "center")
                 c.border = borde_fino()
             ws_det.row_dimensions[fila_det].height = 30
             fila_det += 1

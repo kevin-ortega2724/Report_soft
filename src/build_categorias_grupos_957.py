@@ -2,7 +2,8 @@
 build_categorias_grupos_957.py
 
 Genera data/cache/categorias_grupos_957.json a partir de la hoja
-"Datos Básicos" de cada Excel en reports/excel/<grupo>/<grupo>.xlsx.
+"Datos Básicos" de cada Excel en la carpeta 'data/reporte excel_<fecha>'
+MÁS RECIENTE (scrape actual de GrupLAC).
 
 Para cada grupo extrae:
   - categoria_asignada: valor de "Clasificación" (primera línea, p.ej. "A1", "B")
@@ -10,7 +11,9 @@ Para cada grupo extrae:
                         (p.ej. "Humanidades -- Arte -- ..." → "Humanidades")
 
 Sirve como respaldo de medicion_957.xlsx para grupos que no aparecen en el
-documento oficial de medición (que solo cubre 75 de los 125 grupos).
+documento oficial de medición (que solo cubre 75 de los 125 grupos) y como
+fuente única para "Estadísticas 957" (src/estadisticas_957.py), que solo
+necesita la categoría VIGENTE reportada por GrupLAC, no el cuartil oficial.
 
 Uso:
     python src/build_categorias_grupos_957.py
@@ -24,6 +27,7 @@ from pathlib import Path
 import openpyxl
 
 from utils import obtener_directorio_base
+from views.vista_seguimiento_grupos import _carpeta_gruplac_mas_reciente
 
 
 def _valor_datos_basicos(ws, claves) -> str | None:
@@ -48,7 +52,9 @@ def _hoja_datos_basicos(wb):
 
 def construir_cache(ruta_base: Path | None = None) -> dict:
     if ruta_base is None:
-        ruta_base = obtener_directorio_base() / "reports" / "excel"
+        ruta_base = _carpeta_gruplac_mas_reciente()
+    if ruta_base is None:
+        return {}
 
     grupos = {}
     for carpeta in sorted(ruta_base.iterdir()):

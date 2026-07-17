@@ -93,6 +93,34 @@ corriendo localmente (`ollama serve`) con el modelo `qwen2.5:3b` descargado
 nada a internet. Si Ollama no está disponible, el resto de la app funciona
 igual — solo ese botón puntual queda inactivo.
 
+## Generar el ejecutable de Windows
+
+PyInstaller no puede compilar de forma cruzada: el `.exe` **debe generarse
+en Windows** (no desde Linux/WSL). El repo ya trae el `.venv` con
+PyInstaller instalado y el spec listo (`consolidados.spec`).
+
+```cmd
+build_exe.bat
+```
+
+o manualmente:
+
+```cmd
+.venv\Scripts\activate
+pyinstaller consolidados.spec --clean
+```
+
+El resultado queda en `dist\ReportSoft-Consolidados\ReportSoft-Consolidados.exe`
+(modo *onedir*: el `.exe` + sus DLLs en una carpeta). Antes de correrlo,
+copia `data\` y `config\` junto al `.exe` — igual que hoy quedan junto a
+`run.py` — porque `utils.obtener_directorio_base()` resuelve las rutas
+relativas al ejecutable cuando corre "congelado" (`sys.frozen`).
+
+Se genera en modo *windowed* (sin consola), igual que la app actual. Si el
+primer arranque falla y no ves el motivo, cambia `console=False` a
+`console=True` en `consolidados.spec` para ver el traceback y volver a
+compilar.
+
 ## Historial de cambios
 
 Ver [`CHANGELOG.md`](CHANGELOG.md).

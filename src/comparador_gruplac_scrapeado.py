@@ -191,6 +191,22 @@ _RE_NOMBRE_DEL = re.compile(
 )
 
 
+# Los títulos de trabajos de grado/prácticas son a veces genéricos y se
+# repiten entre muchos estudiantes ("ESTUDIANTE EN PRACTICA" en 103
+# registros reales) -- el bloque scrapeado sí trae el nombre del
+# estudiante/orientado como campo aparte, así que se usa como segunda
+# condición para no confirmar a ciegas el match de un estudiante equivocado
+# (el equivalente de "cédula" que pidió el usuario: GrupLAC no expone el
+# documento del estudiante, pero sí su nombre, en ambos lados).
+_RE_NOMBRE_ESTUDIANTE = re.compile(
+    r"Nombre del (?:estudiante|orientado)\s*:\s*\n?\s*([^\n,]+)", re.IGNORECASE)
+
+
+def _extraer_estudiante(texto: str) -> str:
+    m = _RE_NOMBRE_ESTUDIANTE.search(texto)
+    return m.group(1).strip() if m else ""
+
+
 def _extraer_titulo_anio(texto: str):
     """Cada fila scrapeada trae el título en uno de dos formatos: numerado
     'N.-\\nTIPO\\n: TÍTULO\\n...' (título en la 3ra línea no vacía) -- se
@@ -260,6 +276,7 @@ class ComparadorGrupLACScrapeado(ComparadorFaltantes):
                         continue
                     if anio is not None and not (self.anio_desde <= anio <= self.anio_hasta):
                         continue
+                    estudiante = _extraer_estudiante(texto) if categoria == "trabajos_grado" else ""
                     index.append({
                         "table": nombre_hoja,
                         "product_value": titulo,
@@ -269,6 +286,8 @@ class ComparadorGrupLACScrapeado(ComparadorFaltantes):
                         "group_norm": normalize_text(nombre_grupo),
                         "grupo_id": nombre_grupo,
                         "categoria": categoria,
+                        "estudiante_value": estudiante,
+                        "estudiante_norm": normalize_text(estudiante) if estudiante else "",
                     })
             wb.close()
 
@@ -305,6 +324,41 @@ class ComparadorGrupLACScrapeado(ComparadorFaltantes):
                 grupo_id = best_id
 
             result = self.search_product(producto, grupo_id)
+
+            if row.get("_titulo_generico") and result.get("estado_verificacion") in (
+                    "Confirmado en BD (mismo grupo)", "Registrado en otro grupo"):
+                # Segunda condición (el equivalente de "cédula" que no expone
+                # GrupLAC): si el bloque scrapeado sí trae el nombre del
+                # estudiante/orientado y coincide con el nombre interno, el
+                # match SÍ identifica al estudiante correcto pese al título
+                # compartido -- no hace falta bajarlo a revisión manual.
+                nombre_int = row.get("_estudiante_norm", "")
+                nombre_ext = result.get("estudiante_gruplac", "")
+                nombre_coincide = (
+                    bool(nombre_int) and bool(nombre_ext)
+                    and SequenceMatcher(None, nombre_int, nombre_ext).ratio() >= 0.72
+                )
+                if not nombre_coincide:
+                    mismo_grupo = "mismo grupo" in result["estado_verificacion"]
+                    result = dict(result)
+                    result["estado_verificacion"] = (
+                        "Segundo barrido - mismo grupo" if mismo_grupo
+                        else "Segundo barrido - otro grupo"
+                    )
+                    result["necesita_revision"] = True
+                    result["es_faltante"] = False
+                    if nombre_int and nombre_ext:
+                        nota = (
+                            f"Título genérico y el nombre del estudiante no coincide "
+                            f"(interno: '{row.get('_estudiante_valor', '')}' vs GrupLAC: "
+                            f"'{result.get('estudiante_gruplac_valor', '')}') -- revisar a mano."
+                        )
+                    else:
+                        nota = ("Título genérico -- lo comparte más de un registro interno, no se "
+                                "puede confirmar a ciegas a cuál corresponde este match; revisar a mano.")
+                    previo = result.get("detalle_verificacion", "")
+                    result["detalle_verificacion"] = f"{previo} | {nota}" if previo else nota
+
             results.append({
                 "grupo_original": row.get("grupo", ""),
                 "producto": producto,
@@ -403,7 +457,17 @@ def construir_df_interno(db, anio_desde: int, anio_hasta: int) -> pd.DataFrame:
     por (producto, grupo). Si la tabla no trae 'grupo' propio (o viene
     vacío), se resuelve vía la tabla grupos por cédula -- si la persona
     pertenece a varios grupos, se emite una fila por cada uno (el motor de
-    búsqueda ya sabe distinguir 'está en su grupo' de 'está en otro')."""
+    búsqueda ya sabe distinguir 'está en su grupo' de 'está en otro').
+
+    Si el campo 'grupo' del Excel (proyectos/extensiones) SÍ trae un valor
+    pero NO coincide con ninguno de los grupos internos reales del
+    responsable (tabla grupos, por cédula), se emite TAMBIÉN para esos
+    grupos reales -- no solo para el que quedó escrito en el Excel.
+    Confirmado con datos reales: 67 de 263 proyectos (25%) tienen un
+    'grupo' que no calza con la membresía real del responsable; sin este
+    respaldo, un producto pendiente quedaba invisible en el panel de
+    Cumplimiento del grupo real (aparecía "sin faltantes" ahí simplemente
+    porque el faltante había quedado archivado bajo el grupo equivocado)."""
     cur = db.conn.cursor()
     # cursor aparte para las búsquedas anidadas: reutilizar el mismo cursor
     # que está iterando la consulta externa lo reinicia a medio camino y
@@ -414,13 +478,18 @@ def construir_df_interno(db, anio_desde: int, anio_hasta: int) -> pd.DataFrame:
     cache_nombres = {}
     filas = []
 
-    def _emitir(categoria, hoja, cedula, grupo_col, titulo, issn_isbn="", doi_url=""):
+    def _emitir(categoria, hoja, cedula, grupo_col, titulo, issn_isbn="", doi_url="", estudiante=""):
         titulo = (titulo or "").strip()
         if not titulo:
             return
-        grupos = _limpiar_grupos_crudo(grupo_col) if grupo_col else []
-        if not grupos:
-            grupos = _grupos_de_cedula(cur_grupos, cedula, cache_grupos)
+        grupos_texto = _limpiar_grupos_crudo(grupo_col) if grupo_col else []
+        grupos_reales = _grupos_de_cedula(cur_grupos, cedula, cache_grupos) if cedula else []
+        if not grupos_texto:
+            grupos = grupos_reales
+        else:
+            texto_norm = {normalize_text(g) for g in grupos_texto}
+            extra = [g for g in grupos_reales if normalize_text(g) not in texto_norm]
+            grupos = grupos_texto + extra
         if not grupos:
             grupos = [""]
         producto = clean_supervision_title(_limpiar_titulo_pegado(titulo))
@@ -431,6 +500,8 @@ def construir_df_interno(db, anio_desde: int, anio_hasta: int) -> pd.DataFrame:
                 "_grupo_norm": normalize_text(grupo), "_producto_limpio": producto,
                 "cedula_responsable": cedula or "", "responsable": responsable,
                 "issn_isbn": issn_isbn or "", "doi_url": doi_url or "",
+                "_estudiante_valor": estudiante or "",
+                "_estudiante_norm": normalize_text(estudiante) if estudiante else "",
             })
 
     for cedula, grupo, titulo, issn_isbn, doi_url in cur.execute(
@@ -445,11 +516,18 @@ def construir_df_interno(db, anio_desde: int, anio_hasta: int) -> pd.DataFrame:
             (anio_desde, anio_hasta)):
         _emitir("extensiones", "Extensiones", cedula, grupo, actividad)
 
-    for cedula_director, titulo in cur.execute(
-            "SELECT cedula_director, titulo FROM trabajos_grado "
-            "WHERE año BETWEEN ? AND ? AND titulo IS NOT NULL AND titulo != ''",
+    # Solo "conducentes": un trabajo de grado "no conducente" (ej. una
+    # práctica que no es conducente a título) no se sube a GrupLAC, así que
+    # nunca debe compararse ni contar como faltante -- calificacion es NULL
+    # para el reporte institucional posicional (siempre conducente, ese
+    # archivo no trae prácticas).
+    for cedula_director, titulo, nombre_estudiante in cur.execute(
+            "SELECT cedula_director, titulo, nombre_estudiante FROM trabajos_grado "
+            "WHERE año BETWEEN ? AND ? AND titulo IS NOT NULL AND titulo != '' "
+            "AND (calificacion IS NULL OR calificacion != 'NO CONDUCENTE')",
             (anio_desde, anio_hasta)):
-        _emitir("trabajos_grado", "Trabajos de Grado", cedula_director, "", titulo)
+        _emitir("trabajos_grado", "Trabajos de Grado", cedula_director, "", titulo,
+                estudiante=nombre_estudiante or "")
 
     for cedula, grupo, titulo in cur.execute(
             "SELECT cedula, grupo, titulo FROM proyectos "
@@ -460,6 +538,20 @@ def construir_df_interno(db, anio_desde: int, anio_hasta: int) -> pd.DataFrame:
     df = pd.DataFrame(filas)
     if df.empty:
         return df
+
+    # Los títulos de trabajos de grado (incluye prácticas) a veces son
+    # genéricos y se repiten entre MUCHOS estudiantes distintos ("ESTUDIANTE
+    # EN PRACTICA" se vio repetido en 103 registros reales) -- el motor de
+    # coincidencia por texto no puede saber a CUÁL estudiante corresponde un
+    # match de GrupLAC cuando el título no lo distingue. Se marca acá (antes
+    # de deduplicar, para no perder la señal) y compare_all_groups baja esos
+    # matches a "Segundo barrido" en vez de confirmarlos a ciegas.
+    df["_titulo_generico"] = False
+    es_tg = df["categoria"] == "trabajos_grado"
+    if es_tg.any():
+        conteo = df.loc[es_tg].groupby("_producto_limpio")["_producto_limpio"].transform("count")
+        df.loc[es_tg, "_titulo_generico"] = conteo > 1
+
     # Algunas tablas internas no tienen clave única y repiten filas idénticas
     # (ej. trabajos_grado, ver notas de sesiones previas) -- deduplicar por
     # (grupo, producto, categoría) para no inflar el conteo de faltantes.
